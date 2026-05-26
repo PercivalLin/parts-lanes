@@ -18,6 +18,39 @@
 
 ---
 
+## What is it?
+
+Parts Lanes is a **Codex Agent Skill** bundled with a CLI tool. It ships as a single directory (`.agents/skills/parts-lanes/`) that you drop into any Git repository. Once installed, Codex agents automatically load the skill and follow the lane protocol. The `parts-lane` CLI enforces the rules from the terminal.
+
+Think of it as a set of conventions + a script, not a platform you sign up for.
+
+## Installation
+
+```bash
+# Clone into a temporary location
+git clone https://github.com/PercivalLin/parts-lanes.git /tmp/parts-lanes
+
+# Copy the skill directory and config into your project
+cp -r /tmp/parts-lanes/.agents      your-project/
+cp    /tmp/parts-lanes/.codex        your-project/  # optional, for hook integration
+cp    /tmp/parts-lanes/.parts        your-project/  # optional, parts-lane init creates this
+
+# Make the script executable
+chmod +x your-project/.agents/skills/parts-lanes/scripts/parts-lane
+
+# Initialize Parts Lanes in your project
+cd your-project
+.agents/skills/parts-lanes/scripts/parts-lane init
+```
+
+Or use the script directly without installing the skill:
+
+```bash
+python3 /path/to/parts-lane init
+python3 /path/to/parts-lane begin
+# ...
+```
+
 ## Quick Start
 
 ```bash

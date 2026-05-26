@@ -20,6 +20,39 @@ Worktree 隔离了文件目录，Parts Lanes 隔离了工作内容。每个 AI �
 
 ---
 
+## 这是什么
+
+Parts Lanes 是一个 **Codex Agent Skill**，附带一个 CLI 工具。它以单个目录（`.agents/skills/parts-lanes/`）的形式存在，放入任何 Git 仓库即可生效。安装后，Codex agent 会自动加载 skill 并遵守车道协议。`parts-lane` CLI 则在终端执行规则。
+
+可以把它理解为"一套约定 + 一个脚本"，而不是需要注册的平台。
+
+## 安装
+
+```bash
+# 克隆到临时目录
+git clone https://github.com/PercivalLin/parts-lanes.git /tmp/parts-lanes
+
+# 把 skill 目录和配置复制到你的项目中
+cp -r /tmp/parts-lanes/.agents      你的项目/
+cp    /tmp/parts-lanes/.codex        你的项目/  # 可选，用于 hook 集成
+cp    /tmp/parts-lanes/.parts        你的项目/  # 可选，parts-lane init 会自动创建
+
+# 赋予脚本执行权限
+chmod +x 你的项目/.agents/skills/parts-lanes/scripts/parts-lane
+
+# 在项目中初始化 Parts Lanes
+cd 你的项目
+.agents/skills/parts-lanes/scripts/parts-lane init
+```
+
+或者不安装 skill，直接使用脚本：
+
+```bash
+python3 /path/to/parts-lane init
+python3 /path/to/parts-lane begin
+# ...
+```
+
 ## 快速开始
 
 ```bash
