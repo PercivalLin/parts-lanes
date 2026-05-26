@@ -1,0 +1,48 @@
+version: 1
+
+protected_branches:
+  - main
+  - master
+  - develop
+  - release/*
+
+lane:
+  branch_prefix: parts/
+  worktree_root: .parts/worktrees
+  state_backend: sqlite
+  require_claim_before_edit: true
+  allow_task_update: true
+  scope_drift_warning_revision: 3
+
+protected_paths:
+  - .github/workflows/**
+  - infra/**
+  - secrets/**
+  - .env
+  - .env.*
+
+high_risk_paths:
+  - package-lock.json
+  - pnpm-lock.yaml
+  - yarn.lock
+  - migrations/**
+
+checks:
+  default:
+    - name: test
+      command: npm test
+    - name: typecheck
+      command: npm run typecheck
+    - name: lint
+      command: npm run lint
+
+ready:
+  require:
+    - lane_exists
+    - task_set
+    - not_on_protected_branch
+    - no_claim_conflict
+    - actual_changes_within_claim
+    - no_actual_file_overlap
+    - no_protected_path_change
+    - checks_after_latest_diff

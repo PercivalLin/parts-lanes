@@ -1,0 +1,2408 @@
+#!/usr/bin/env python3
+"""Parts Lanes -- parallel development lane protocol for AI coding agents.
+
+Prevents multiple AI agents from editing the same files in the same repo
+by requiring path claims before editing, diff syncing, and gate/check/ready
+verification before completion.
+"""
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ============================================================================
+# CONFIGURATION TEMPLATES (embedded strings for `init`)
+# ============================================================================
+
+TEMPLATE_GITIGNORE = """\
+# Parts Lanes runtime state (not committed)
+.git/parts/
+
+# Parts worktrees (not committed)
+.parts/worktrees/
+"""
+
+TEMPLATE_AGENTS_MD = """\
+# AGENTS.md
+
+This repository uses Parts Lanes.
+
+For every coding task, use the `parts-lanes` skill before editing code.
+
+Required workflow:
+
+1. Identify or create your current Lane.
+2. Set or update the Lane task after the user gives instructions.
+3. Claim the files or directories you expect to modify.
+4. Work only inside your Lane workspace.
+5. Sync actual changed files after edits.
+6. Run gate checks before claiming progress.
+7. Run ready checks before claiming completion.
+
+Never claim completion unless `parts-lane ready` reports ready.
+
+Do not directly edit Lane state files. Use the `parts-lane` script only.
+"""
+
+TEMPLATE_SKILL_MD = """\
+---
+name: parts-lanes
+description: Use this skill whenever editing code in a Git repository with Codex threads, subagents, worktrees, or parallel AI sessions. It prevents agents from editing the same files, losing track of their current task, or claiming completion before lane checks pass.
+---
+
+# Parts Lanes Skill
+
+You are working in a repository that uses Parts Lanes.
+
+Your goal is to complete the user's coding task while staying inside your own Lane and avoiding collisions with other AI or human work.
+
+## Core rules
+
+1. Never edit code before identifying your Lane.
+2. A Lane may exist before it has a task.
+3. The user may define or change your task after the Lane exists.
+4. Changing the task does not automatically allow new file paths.
+5. Claim paths before editing them.
+6. Sync after edits.
+7. Run gate before reporting progress.
+8. Run ready before claiming completion.
+
+## Required workflow
+
+### 1. Identify the current Lane
+
+Run:
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane current
+```
+
+If there is no Lane, run:
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane begin
+```
+
+### 2. Set or update the task
+
+If the Lane has no task, summarize the user's instruction and run:
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane task set "<task summary>"
+```
+
+If the user changes the task, run:
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane task update "<new task summary>"
+```
+
+### 3. Claim paths before editing
+
+After inspecting the repo, claim likely paths:
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane claim "src/auth/**" "tests/auth/**"
+```
+
+If claim fails, stop and report the collision.
+
+### 4. Edit only claimed paths
+
+If you need another path, use:
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane claim-add "new/path/**"
+```
+
+### 5. Sync after editing
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane sync
+```
+
+### 6. Gate before progress
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane gate
+```
+
+### 7. Check and ready before completion
+
+```bash
+.agents/skills/parts-lanes/scripts/parts-lane check
+.agents/skills/parts-lanes/scripts/parts-lane ready
+```
+
+Only claim completion if ready passes.
+
+## Never do these
+
+- Do not work on protected branches directly.
+- Do not edit unclaimed paths.
+- Do not ignore claim conflicts.
+- Do not claim tests passed unless `parts-lane check` recorded them after the latest diff.
+- Do not directly edit `.git/parts` state.
+- Do not delete or modify another Lane.
+"""
+
+TEMPLATE_LANE_PROTOCOL_MD = """\
+# Parts Lanes Protocol Reference
+
+## Lane Concept
+
+A Lane is a runtime state object that represents one AI coding thread's identity, task, and code claims. Each Codex thread or worktree session gets its own Lane.
+
+## Lane Lifecycle
+
+```
+idle -> active -> closed
+```
+
+- **idle**: Lane exists but has no task. Waiting for user instructions.
+- **active**: Lane has a task set. Agent is working on it.
+- **closed**: Lane is complete. No further edits.
+
+## Claim-Before-Edit Contract
+
+Before editing any file, the agent must claim the path pattern (e.g., `src/auth/**`). The claim system prevents two lanes from editing overlapping code.
+
+Claim validation rules:
+- Patterns must contain at least one concrete directory segment before any glob wildcard
+- `src/**` is too broad and will be rejected
+- `src/auth/**` is valid (2 concrete segments before `**`)
+- `src/auth/login.ts` is valid (exact file)
+
+## Gate / Check / Ready Pipeline
+
+### Gate (deterministic checks)
+- Not on a protected branch
+- No claim conflicts with other lanes
+- Actual changed files are within claimed paths
+- No actual file overlap with other lanes
+- No changes to protected paths
+- Checks have been run against the current diff
+
+### Check (user-defined verification)
+Runs configured commands (e.g., `npm test`, `npm run typecheck`) and records results. Check results are bound to the diff hash -- if code changes after a check, the check is invalidated.
+
+### Ready (completion gate)
+All gate checks pass + all configured checks pass for the current diff = ready.
+
+## Lane Identification (Three-Tier)
+
+1. **Codex Hook Identity**: Uses `session_id` and `agent_id` from hook JSON stdin to look up lane binding in the `thread_bindings` table.
+2. **Git Workspace Identity**: Matches current git branch or worktree path to a known lane.
+3. **Local Fallback**: Last-resort mapping stored in `.git/parts/current_lane_by_cwd.json`.
+
+## State Schema
+
+Lane state is stored in `.git/parts/state.sqlite` with these tables:
+
+- `lanes`: Core lane records (id, state, task_summary, task_revision, branch, worktree, session_id, agent_id, timestamps)
+- `claims`: Path claims per lane (lane_id, pattern, timestamp)
+- `observed_files`: Files actually changed per lane (lane_id, path, diff_hash, timestamp)
+- `checks`: Check execution results (lane_id, name, command, exit_code, status, duration_ms, diff_hash, stdout_tail, stderr_tail, timestamp)
+- `events`: Event log for auditing (lane_id, type, payload_json, timestamp)
+- `thread_bindings`: Maps Codex session/agent IDs to lanes (session_id, agent_id, lane_id, cwd, status)
+"""
+
+TEMPLATE_CONFIG_YAML = """\
+version: 1
+
+protected_branches:
+  - main
+  - master
+  - develop
+  - release/*
+
+lane:
+  branch_prefix: parts/
+  worktree_root: .parts/worktrees
+  state_backend: sqlite
+  require_claim_before_edit: true
+  allow_task_update: true
+  scope_drift_warning_revision: 3
+
+protected_paths:
+  - .github/workflows/**
+  - infra/**
+  - secrets/**
+  - .env
+  - .env.*
+
+high_risk_paths:
+  - package-lock.json
+  - pnpm-lock.yaml
+  - yarn.lock
+  - migrations/**
+
+checks:
+  default:
+    - name: test
+      command: npm test
+    - name: typecheck
+      command: npm run typecheck
+    - name: lint
+      command: npm run lint
+
+ready:
+  require:
+    - lane_exists
+    - task_set
+    - not_on_protected_branch
+    - no_claim_conflict
+    - actual_changes_within_claim
+    - no_actual_file_overlap
+    - no_protected_path_change
+    - checks_after_latest_diff
+"""
+
+TEMPLATE_HOOKS_JSON = """\
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook session-start",
+            "statusMessage": "Attaching Parts Lane"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook subagent-start",
+            "statusMessage": "Creating Parts Lane for subagent"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook user-prompt-submit",
+            "statusMessage": "Checking current Parts Lane"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook post-edit",
+            "statusMessage": "Syncing Parts Lane diff"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook stop",
+            "statusMessage": "Running Parts Lane gate"
+          }
+        ]
+      }
+    ]
+  }
+}
+"""
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+
+def get_repo_root() -> str | None:
+    """Walk up from cwd to find the git repository root. Returns None if not in a repo."""
+    cwd = os.getcwd()
+    while cwd != "/":
+        if os.path.isdir(os.path.join(cwd, ".git")):
+            return cwd
+        parent = os.path.dirname(cwd)
+        if parent == cwd:
+            break
+        cwd = parent
+    return None
+
+
+def die(msg: str, code: int = 1) -> None:
+    """Print error to stderr and exit."""
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso() -> str:
+    """Return current UTC timestamp in ISO format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def compute_diff_hash(diff_binary: bytes) -> str:
+    """Compute SHA-256 hash of binary diff output."""
+    return hashlib.sha256(diff_binary).hexdigest()
+
+
+def match_pattern(path: str, pattern: str) -> bool:
+    """Check if a file path matches a glob pattern."""
+    return fnmatch.fnmatch(path, pattern)
+
+
+# ============================================================================
+# PartsConfig -- .parts/config.yaml loader
+# ============================================================================
+
+
+class PartsConfig:
+    """Loads and provides typed access to .parts/config.yaml."""
+
+    def __init__(self, repo_root: str):
+        self._repo_root = repo_root
+        self._data: dict = {}
+        self._load()
+
+    def _load(self):
+        config_path = os.path.join(self._repo_root, ".parts", "config.yaml")
+        if not os.path.isfile(config_path):
+            return
+        self._data = self._parse_yaml_file(config_path)
+
+    @staticmethod
+    def _parse_yaml_file(path: str) -> dict:
+        """Minimal YAML parser for the config schema subset."""
+        result: dict = {}
+
+        with open(path) as f:
+            raw_lines = f.readlines()
+
+        lines = raw_lines
+
+        def _peek_type(start_idx: int, context_indent: int) -> str:
+            """Return 'list', 'map', or 'empty' based on what follows."""
+            for j in range(start_idx, len(lines)):
+                nl = lines[j].rstrip()
+                if not nl or nl.startswith("#"):
+                    continue
+                ni = len(lines[j]) - len(lines[j].lstrip())
+                if ni <= context_indent:
+                    return "empty"
+                stripped_nl = nl.lstrip()
+                if stripped_nl.startswith("- "):
+                    return "list"
+                else:
+                    return "map"
+            return "empty"
+
+        def _parse_value(raw: str):
+            """Parse a scalar value string."""
+            s = raw.strip()
+            if s.isdigit():
+                return int(s)
+            if s in ("true", "false"):
+                return s == "true"
+            return s
+
+        def _parse_list(start_idx: int, context_indent: int) -> list:
+            """Parse a YAML list starting at start_idx."""
+            result_list = []
+            j = start_idx
+            while j < len(lines):
+                line_j = lines[j]
+                stripped_j = line_j.rstrip()
+                if not stripped_j or stripped_j.startswith("#"):
+                    j += 1
+                    continue
+                ni = len(line_j) - len(line_j.lstrip())
+                if ni <= context_indent:
+                    break
+                if stripped_j.lstrip().startswith("- "):
+                    item = stripped_j.lstrip()[2:].strip()
+                    if ": " in item:
+                        entry = {}
+                        k, _, v = item.partition(": ")
+                        entry[k.strip()] = _parse_value(v)
+                        j += 1
+                        while j < len(lines):
+                            next_line = lines[j]
+                            next_stripped = next_line.rstrip()
+                            if not next_stripped or next_stripped.startswith("#"):
+                                j += 1
+                                continue
+                            next_indent = len(next_line) - len(next_line.lstrip())
+                            if next_indent <= ni:
+                                break
+                            if ": " in next_stripped:
+                                nk, _, nv = next_stripped.partition(": ")
+                                entry[nk.strip()] = _parse_value(nv)
+                            elif next_stripped.lstrip().startswith("- "):
+                                break
+                            j += 1
+                        result_list.append(entry)
+                        continue
+                    else:
+                        result_list.append(item)
+                j += 1
+            return result_list
+
+        def _parse_map(start_idx: int, context_indent: int) -> dict:
+            """Parse a YAML mapping starting at start_idx."""
+            result_map = {}
+            j = start_idx
+            while j < len(lines):
+                line_j = lines[j]
+                stripped_j = line_j.rstrip()
+                if not stripped_j or stripped_j.startswith("#"):
+                    j += 1
+                    continue
+                ni = len(line_j) - len(line_j.lstrip())
+                if ni <= context_indent:
+                    break
+                if ": " in stripped_j:
+                    key, _, val = stripped_j.strip().partition(": ")
+                    key = key.strip()
+                    val = val.strip()
+                    if key.startswith("- "):
+                        key = key[2:]
+                    if val:
+                        result_map[key] = _parse_value(val)
+                    else:
+                        child_type = _peek_type(j + 1, ni)
+                        if child_type == "list":
+                            result_map[key] = _parse_list(j + 1, ni)
+                        elif child_type == "map":
+                            result_map[key] = _parse_map(j + 1, ni)
+                j += 1
+            return result_map
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.rstrip()
+            indent = len(line) - len(line.lstrip())
+
+            if not stripped or stripped.startswith("#"):
+                i += 1
+                continue
+
+            if indent == 0 and ": " in stripped:
+                key, _, val = stripped.partition(": ")
+                key = key.strip()
+                if val.strip():
+                    result[key] = _parse_value(val)
+                else:
+                    child_type = _peek_type(i + 1, indent)
+                    if child_type == "list":
+                        result[key] = _parse_list(i + 1, indent)
+                    elif child_type == "map":
+                        result[key] = _parse_map(i + 1, indent)
+                i += 1
+                continue
+
+            if indent == 0 and stripped.endswith(":"):
+                key = stripped[:-1].strip()
+                child_type = _peek_type(i + 1, indent)
+                if child_type == "list":
+                    result[key] = _parse_list(i + 1, indent)
+                elif child_type == "map":
+                    result[key] = _parse_map(i + 1, indent)
+                else:
+                    result[key] = []
+                i += 1
+                continue
+
+            i += 1
+
+        return result
+
+    @property
+    def protected_branches(self) -> list:
+        return self._data.get("protected_branches", [])
+
+    @property
+    def protected_paths(self) -> list:
+        return self._data.get("protected_paths", [])
+
+    @property
+    def high_risk_paths(self) -> list:
+        return self._data.get("high_risk_paths", [])
+
+    @property
+    def checks(self) -> list:
+        cd = self._data.get("checks", {})
+        if isinstance(cd, dict):
+            return cd.get("default", [])
+        return []
+
+    @property
+    def ready_requirements(self) -> list:
+        rd = self._data.get("ready", {})
+        if isinstance(rd, dict):
+            return rd.get("require", [])
+        return []
+
+    @property
+    def lane_config(self) -> dict:
+        return self._data.get("lane", {})
+
+    @property
+    def scope_drift_warning_revision(self) -> int:
+        lc = self.lane_config
+        return lc.get("scope_drift_warning_revision", 3)
+
+    @property
+    def branch_prefix(self) -> str:
+        return self.lane_config.get("branch_prefix", "parts/")
+
+    @property
+    def worktree_root(self) -> str:
+        return self.lane_config.get("worktree_root", ".parts/worktrees")
+
+    def is_protected_branch(self, branch: str) -> bool:
+        for pattern in self.protected_branches:
+            if fnmatch.fnmatch(branch, pattern):
+                return True
+        return False
+
+    def is_protected_path(self, path: str) -> bool:
+        for pattern in self.protected_paths:
+            if fnmatch.fnmatch(path, pattern):
+                return True
+        return False
+
+    def is_high_risk_path(self, path: str) -> bool:
+        for pattern in self.high_risk_paths:
+            if fnmatch.fnmatch(path, pattern):
+                return True
+        return False
+
+
+# ============================================================================
+# GitHelper -- git subprocess wrappers
+# ============================================================================
+
+
+class GitHelper:
+    """Wraps git subprocess calls for lane operations."""
+
+    def __init__(self, repo_root: str):
+        self._repo_root = repo_root
+
+    def _run(self, *args: str, capture: bool = True) -> str:
+        """Run a git command and return stdout."""
+        try:
+            result = subprocess.run(
+                ["git"] + list(args),
+                cwd=self._repo_root,
+                capture_output=capture,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return ""
+            return result.stdout.rstrip("\n") if capture else ""
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+
+    def _run_bytes(self, *args: str) -> bytes:
+        """Run a git command and return stdout as bytes."""
+        try:
+            result = subprocess.run(
+                ["git"] + list(args),
+                cwd=self._repo_root,
+                capture_output=True,
+                timeout=30,
+            )
+            return result.stdout if result.returncode == 0 else b""
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            return b""
+
+    @property
+    def repo_root(self) -> str:
+        return self._repo_root
+
+    def current_branch(self) -> str:
+        return self._run("branch", "--show-current")
+
+    def current_worktree_path(self) -> str:
+        """Get the current worktree path or the main repo path."""
+        # git worktree list with --porcelain shows each worktree
+        cwd = os.getcwd()
+        output = self._run("worktree", "list", "--porcelain")
+        if not output:
+            return self._repo_root
+
+        current_worktree = self._repo_root
+        entries = output.split("\n\n")
+        for entry in entries:
+            lines = entry.strip().split("\n")
+            wt_path = ""
+            for line in lines:
+                if line.startswith("worktree "):
+                    wt_path = line[len("worktree "):]
+            if wt_path and cwd.startswith(wt_path):
+                current_worktree = wt_path
+
+        return current_worktree
+
+    def diff_files(self) -> list:
+        """Return list of changed files from git diff."""
+        output = self._run("diff", "--name-only")
+        if not output:
+            return []
+        return [f for f in output.split("\n") if f]
+
+    def diff_binary(self) -> bytes:
+        return self._run_bytes("diff", "--binary")
+
+    def diff_hash(self) -> str:
+        """Compute SHA-256 of git diff --binary output."""
+        data = self.diff_binary()
+        return compute_diff_hash(data)
+
+    def status_porcelain(self) -> str:
+        return self._run("status", "--porcelain")
+
+    def has_diff(self) -> bool:
+        return len(self.diff_files()) > 0
+
+
+# ============================================================================
+# LaneStore -- SQLite state management
+# ============================================================================
+
+
+class LaneStore:
+    """Manages all persistent lane state in SQLite."""
+
+    def __init__(self, repo_root: str):
+        self._repo_root = repo_root
+        self._db_dir = os.path.join(repo_root, ".git", "parts")
+        os.makedirs(self._db_dir, exist_ok=True)
+        self._db_path = os.path.join(self._db_dir, "state.sqlite")
+        self._conn = sqlite3.connect(self._db_path)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+
+    def _init_schema(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS lanes (
+                id              TEXT PRIMARY KEY,
+                state           TEXT NOT NULL DEFAULT 'idle',
+                task_summary    TEXT,
+                task_revision   INTEGER NOT NULL DEFAULT 0,
+                branch          TEXT,
+                worktree        TEXT,
+                session_id      TEXT,
+                agent_id        TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS claims (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                lane_id     TEXT NOT NULL,
+                pattern     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY (lane_id) REFERENCES lanes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS observed_files (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                lane_id     TEXT NOT NULL,
+                path        TEXT NOT NULL,
+                diff_hash   TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                FOREIGN KEY (lane_id) REFERENCES lanes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS checks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                lane_id     TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                command     TEXT NOT NULL,
+                exit_code   INTEGER,
+                status      TEXT NOT NULL,
+                duration_ms REAL,
+                diff_hash   TEXT NOT NULL,
+                stdout_tail TEXT,
+                stderr_tail TEXT,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY (lane_id) REFERENCES lanes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                lane_id     TEXT NOT NULL,
+                type        TEXT NOT NULL,
+                payload_json TEXT,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY (lane_id) REFERENCES lanes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS thread_bindings (
+                session_id  TEXT,
+                agent_id    TEXT DEFAULT '',
+                lane_id     TEXT NOT NULL,
+                cwd         TEXT,
+                status      TEXT NOT NULL DEFAULT 'active',
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (session_id, agent_id),
+                FOREIGN KEY (lane_id) REFERENCES lanes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_claims_lane ON claims(lane_id);
+            CREATE INDEX IF NOT EXISTS idx_observed_files_lane ON observed_files(lane_id);
+            CREATE INDEX IF NOT EXISTS idx_checks_lane ON checks(lane_id);
+            CREATE INDEX IF NOT EXISTS idx_events_lane ON events(lane_id);
+        """)
+        self._conn.commit()
+
+    # --- Lane CRUD ---
+
+    def next_lane_id(self) -> str:
+        row = self._conn.execute("SELECT COUNT(*) FROM lanes").fetchone()
+        n = (row[0] or 0) + 1 if row else 1
+        return f"L-{n:03d}"
+
+    def create_lane(self, lane_id: str | None = None,
+                    branch: str | None = None,
+                    worktree: str | None = None,
+                    session_id: str | None = None,
+                    agent_id: str | None = None) -> str:
+        if lane_id is None:
+            lane_id = self.next_lane_id()
+        ts = now_iso()
+        self._conn.execute(
+            """INSERT INTO lanes (id, state, task_revision, branch, worktree,
+               session_id, agent_id, created_at, updated_at)
+               VALUES (?, 'idle', 0, ?, ?, ?, ?, ?, ?)""",
+            (lane_id, branch, worktree, session_id, agent_id, ts, ts),
+        )
+        self._conn.commit()
+        return lane_id
+
+    def get_lane(self, lane_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT id, state, task_summary, task_revision, branch, worktree, "
+            "session_id, agent_id, created_at, updated_at FROM lanes WHERE id = ?",
+            (lane_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "state": row[1], "task_summary": row[2],
+            "task_revision": row[3], "branch": row[4], "worktree": row[5],
+            "session_id": row[6], "agent_id": row[7],
+            "created_at": row[8], "updated_at": row[9],
+        }
+
+    def update_lane(self, lane_id: str, **kwargs):
+        if not kwargs:
+            return
+        kwargs["updated_at"] = now_iso()
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [lane_id]
+        self._conn.execute(
+            f"UPDATE lanes SET {set_clause} WHERE id = ?", values
+        )
+        self._conn.commit()
+
+    def list_lanes(self, active_only: bool = False) -> list:
+        if active_only:
+            rows = self._conn.execute(
+                "SELECT id, state, task_summary, task_revision, branch, worktree, "
+                "session_id, agent_id, created_at, updated_at FROM lanes "
+                "WHERE state != 'closed' ORDER BY id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, state, task_summary, task_revision, branch, worktree, "
+                "session_id, agent_id, created_at, updated_at FROM lanes ORDER BY id"
+            ).fetchall()
+        return [
+            {
+                "id": r[0], "state": r[1], "task_summary": r[2],
+                "task_revision": r[3], "branch": r[4], "worktree": r[5],
+                "session_id": r[6], "agent_id": r[7],
+                "created_at": r[8], "updated_at": r[9],
+            }
+            for r in rows
+        ]
+
+    def close_lane(self, lane_id: str):
+        self.update_lane(lane_id, state="closed")
+
+    # --- Claims ---
+
+    def add_claim(self, lane_id: str, pattern: str):
+        self._conn.execute(
+            "INSERT INTO claims (lane_id, pattern, created_at) VALUES (?, ?, ?)",
+            (lane_id, pattern, now_iso()),
+        )
+        self._conn.commit()
+
+    def get_claims(self, lane_id: str) -> list:
+        rows = self._conn.execute(
+            "SELECT pattern FROM claims WHERE lane_id = ?", (lane_id,)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_all_active_claims(self, exclude_lane_id: str | None = None) -> list:
+        """Return all claims from active (non-closed) lanes, optionally excluding one."""
+        if exclude_lane_id:
+            rows = self._conn.execute(
+                """SELECT c.lane_id, c.pattern FROM claims c
+                   JOIN lanes l ON c.lane_id = l.id
+                   WHERE l.state != 'closed' AND c.lane_id != ?""",
+                (exclude_lane_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT c.lane_id, c.pattern FROM claims c
+                   JOIN lanes l ON c.lane_id = l.id
+                   WHERE l.state != 'closed'"""
+            ).fetchall()
+        return [{"lane_id": r[0], "pattern": r[1]} for r in rows]
+
+    # --- Observed Files ---
+
+    def set_observed_files(self, lane_id: str, files: list, diff_hash: str):
+        ts = now_iso()
+        self._conn.execute(
+            "DELETE FROM observed_files WHERE lane_id = ?", (lane_id,)
+        )
+        for path in files:
+            self._conn.execute(
+                "INSERT INTO observed_files (lane_id, path, diff_hash, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (lane_id, path, diff_hash, ts),
+            )
+        self._conn.commit()
+
+    def get_observed_files(self, lane_id: str) -> list:
+        rows = self._conn.execute(
+            "SELECT path, diff_hash FROM observed_files WHERE lane_id = ?",
+            (lane_id,),
+        ).fetchall()
+        return [{"path": r[0], "diff_hash": r[1]} for r in rows]
+
+    def get_observed_diff_hash(self, lane_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT diff_hash FROM observed_files WHERE lane_id = ? LIMIT 1",
+            (lane_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_all_active_observed_files(self, exclude_lane_id: str | None = None) -> list:
+        """Return observed files from all active lanes, optionally excluding one."""
+        if exclude_lane_id:
+            rows = self._conn.execute(
+                """SELECT o.lane_id, o.path FROM observed_files o
+                   JOIN lanes l ON o.lane_id = l.id
+                   WHERE l.state != 'closed' AND o.lane_id != ?""",
+                (exclude_lane_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT o.lane_id, o.path FROM observed_files o
+                   JOIN lanes l ON o.lane_id = l.id
+                   WHERE l.state != 'closed'"""
+            ).fetchall()
+        return [{"lane_id": r[0], "path": r[1]} for r in rows]
+
+    # --- Checks ---
+
+    def add_check_result(self, lane_id: str, name: str, command: str,
+                         exit_code: int, status: str, duration_ms: float,
+                         diff_hash: str, stdout_tail: str, stderr_tail: str):
+        self._conn.execute(
+            """INSERT INTO checks (lane_id, name, command, exit_code, status,
+               duration_ms, diff_hash, stdout_tail, stderr_tail, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lane_id, name, command, exit_code, status, duration_ms,
+             diff_hash, stdout_tail, stderr_tail, now_iso()),
+        )
+        self._conn.commit()
+
+    def get_checks_for_hash(self, lane_id: str, diff_hash: str) -> list:
+        rows = self._conn.execute(
+            "SELECT name, command, exit_code, status, duration_ms, diff_hash, "
+            "stdout_tail, stderr_tail, created_at FROM checks "
+            "WHERE lane_id = ? AND diff_hash = ? ORDER BY created_at DESC",
+            (lane_id, diff_hash),
+        ).fetchall()
+        return [
+            {
+                "name": r[0], "command": r[1], "exit_code": r[2],
+                "status": r[3], "duration_ms": r[4], "diff_hash": r[5],
+                "stdout_tail": r[6], "stderr_tail": r[7], "created_at": r[8],
+            }
+            for r in rows
+        ]
+
+    def get_latest_check_diff_hash(self, lane_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT diff_hash FROM checks WHERE lane_id = ? ORDER BY created_at DESC LIMIT 1",
+            (lane_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    # --- Events ---
+
+    def add_event(self, lane_id: str, event_type: str, payload: dict | None = None):
+        payload_json = json.dumps(payload) if payload else None
+        self._conn.execute(
+            "INSERT INTO events (lane_id, type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (lane_id, event_type, payload_json, now_iso()),
+        )
+        self._conn.commit()
+
+    def get_events(self, lane_id: str, limit: int = 50) -> list:
+        rows = self._conn.execute(
+            "SELECT type, payload_json, created_at FROM events WHERE lane_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (lane_id, limit),
+        ).fetchall()
+        return [
+            {"type": r[0], "payload": json.loads(r[1]) if r[1] else None, "created_at": r[2]}
+            for r in rows
+        ]
+
+    # --- Thread Bindings ---
+
+    def bind_thread(self, session_id: str, lane_id: str, cwd: str | None = None,
+                    agent_id: str = ""):
+        self._conn.execute(
+            """INSERT OR REPLACE INTO thread_bindings (session_id, agent_id, lane_id, cwd, status, created_at)
+               VALUES (?, ?, ?, ?, 'active', ?)""",
+            (session_id, agent_id, lane_id, cwd, now_iso()),
+        )
+        self._conn.commit()
+
+    def get_lane_by_thread(self, session_id: str, agent_id: str = "") -> str | None:
+        row = self._conn.execute(
+            "SELECT lane_id FROM thread_bindings WHERE session_id = ? AND agent_id = ? AND status = 'active'",
+            (session_id, agent_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_lane_by_branch(self, branch: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT id FROM lanes WHERE branch = ? AND state != 'closed'", (branch,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_lane_by_worktree(self, worktree: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT id FROM lanes WHERE worktree = ? AND state != 'closed'", (worktree,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_cwd_fallback(self, cwd: str) -> str | None:
+        """Read cwd-to-lane mapping from fallback file."""
+        fallback_path = os.path.join(self._db_dir, "current_lane_by_cwd.json")
+        if os.path.isfile(fallback_path):
+            try:
+                with open(fallback_path) as f:
+                    data = json.load(f)
+                return data.get(cwd)
+            except (json.JSONDecodeError, IOError):
+                return None
+        return None
+
+    def set_cwd_fallback(self, cwd: str, lane_id: str):
+        """Write cwd-to-lane mapping to fallback file."""
+        fallback_path = os.path.join(self._db_dir, "current_lane_by_cwd.json")
+        data = {}
+        if os.path.isfile(fallback_path):
+            try:
+                with open(fallback_path) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                data = {}
+        data[cwd] = lane_id
+        with open(fallback_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def close(self):
+        self._conn.close()
+
+
+# ============================================================================
+# ClaimEngine -- pattern matching and conflict detection
+# ============================================================================
+
+
+class ClaimEngine:
+    """Validates claim patterns and detects conflicts between lanes."""
+
+    @staticmethod
+    def validate_pattern(pattern: str) -> tuple[bool, str]:
+        """Check if a claim pattern is acceptably specific.
+
+        Returns (valid, reason).
+        Rejects patterns that are too broad: src/**, **/*, *, etc.
+        Requires at least 2 concrete directory segments before the first **.
+        """
+        pattern = pattern.strip().lstrip("./")
+
+        # Exact file path without globs is always valid
+        if "*" not in pattern and "?" not in pattern and "[" not in pattern:
+            return True, ""
+
+        # Reject single-segment globs like * or **/*
+        if pattern in ("*", "**", "**/*"):
+            return False, "pattern too broad: would match everything"
+
+        # Count concrete (non-glob) segments before the first ** or *
+        segments = pattern.replace("\\", "/").split("/")
+        concrete_count = 0
+        for seg in segments:
+            if seg == "**":
+                break
+            if any(c in seg for c in "*?[]"):
+                break
+            concrete_count += 1
+
+        if concrete_count < 2 and "**" in segments:
+            return False, (
+                f"pattern too broad: '{pattern}' -- "
+                f"require at least 2 concrete directory segments before '**' "
+                f"(e.g., 'src/auth/**' is valid)"
+            )
+
+        if "**" not in segments and concrete_count < 2 and "*" in pattern:
+            # For patterns like src/*.ts (one concrete segment + filename glob)
+            if concrete_count >= 1:
+                return True, ""
+            return False, (
+                f"pattern too broad: '{pattern}' -- "
+                "require at least 2 concrete directory segments"
+            )
+
+        return True, ""
+
+    @staticmethod
+    def patterns_overlap(pattern_a: str, pattern_b: str) -> bool:
+        """Determine if two glob patterns could match the same file.
+
+        Uses conservative prefix-based overlap: if the concrete prefix of one
+        is a prefix of the other, they overlap. This may produce false positives
+        but never false negatives (missed conflicts).
+        """
+        pa = pattern_a.strip().lstrip("./")
+        pb = pattern_b.strip().lstrip("./")
+
+        # Exact equality = overlap
+        if pa == pb:
+            return True
+
+        # Extract concrete prefix (up to the first glob character)
+        def concrete_prefix(p: str) -> str:
+            segments = p.replace("\\", "/").split("/")
+            result = []
+            for seg in segments:
+                if any(c in seg for c in "*?[]"):
+                    break
+                result.append(seg)
+            return "/".join(result)
+
+        prefix_a = concrete_prefix(pa)
+        prefix_b = concrete_prefix(pb)
+
+        if not prefix_a or not prefix_b:
+            return True  # one has no concrete prefix, conservative fallback
+
+        # Check if one is a prefix of the other
+        if prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a):
+            return True
+
+        # Also check: if pattern_b is a specific file within pattern_a's glob
+        # e.g., src/auth/** overlaps with src/auth/session.ts
+        if fnmatch.fnmatch(pb, pa) or fnmatch.fnmatch(pa, pb):
+            return True
+
+        return False
+
+    @staticmethod
+    def find_claim_conflicts(lane_id: str, new_patterns: list,
+                             store: LaneStore) -> list:
+        """Check new_patterns against all active claims from other lanes.
+
+        Returns list of {conflicting_lane_id, conflicting_pattern, your_pattern}.
+        """
+        conflicts = []
+        existing = store.get_all_active_claims(exclude_lane_id=lane_id)
+
+        for new_pat in new_patterns:
+            for claim in existing:
+                if ClaimEngine.patterns_overlap(new_pat, claim["pattern"]):
+                    conflicts.append({
+                        "conflicting_lane_id": claim["lane_id"],
+                        "conflicting_pattern": claim["pattern"],
+                        "your_pattern": new_pat,
+                    })
+
+        return conflicts
+
+    @staticmethod
+    def path_within_claims(path: str, claims: list) -> bool:
+        """Check if a file path is covered by at least one claim pattern."""
+        for pattern in claims:
+            if fnmatch.fnmatch(path, pattern):
+                return True
+        return False
+
+    @staticmethod
+    def find_observed_overlap(lane_id: str, store: LaneStore) -> list:
+        """Check if current lane's observed files overlap with other lanes' observed files.
+
+        Returns list of {other_lane_id, overlapping_file}.
+        """
+        my_files = store.get_observed_files(lane_id)
+        my_paths = {f["path"] for f in my_files}
+        others = store.get_all_active_observed_files(exclude_lane_id=lane_id)
+
+        overlaps = []
+        seen = set()
+        for other in others:
+            if other["path"] in my_paths and other["path"] not in seen:
+                overlaps.append({
+                    "other_lane_id": other["lane_id"],
+                    "overlapping_file": other["path"],
+                })
+                seen.add(other["path"])
+
+        return overlaps
+
+    @staticmethod
+    def find_active_thread_count(repo_root: str, store: LaneStore) -> int:
+        """Estimate count of active threads in the current directory."""
+        lanes = store.list_lanes(active_only=True)
+        cwd = os.getcwd()
+        count = 0
+        for lane in lanes:
+            wt = lane.get("worktree", "")
+            branch = lane.get("branch", "")
+            if not wt or cwd.startswith(wt) or cwd == repo_root:
+                count += 1
+        return count
+
+
+# ============================================================================
+# HookHelper -- stdin JSON parsing for Codex hooks
+# ============================================================================
+
+
+class HookHelper:
+    """Parses JSON hook context from Codex stdin."""
+
+    @staticmethod
+    def parse() -> dict | None:
+        """Read and parse JSON from stdin. Returns None if no input or invalid."""
+        if sys.stdin.isatty():
+            return None
+        try:
+            raw = sys.stdin.read()
+            if not raw.strip():
+                return None
+            return json.loads(raw)
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    @staticmethod
+    def get_thread_identity(hook_data: dict) -> tuple[str, str, str]:
+        """Extract (session_id, agent_id, cwd) from hook data."""
+        session_id = hook_data.get("session_id", "")
+        agent_id = hook_data.get("agent_id", "")
+        cwd = hook_data.get("cwd", os.getcwd())
+        return session_id, agent_id, cwd
+
+
+# ============================================================================
+# COMMAND IMPLEMENTATIONS
+# ============================================================================
+
+
+def cmd_init(args, repo_root: str):
+    """Initialize Parts Lanes in the current repository."""
+    # Ensure git repo exists
+    git_dir = os.path.join(repo_root, ".git")
+    if not os.path.isdir(git_dir):
+        subprocess.run(["git", "init"], cwd=repo_root, capture_output=True)
+        print("Initialized git repository.")
+
+    # Create directories
+    dirs = [
+        ".agents/skills/parts-lanes/scripts",
+        ".agents/skills/parts-lanes/references",
+        ".parts",
+        ".codex",
+    ]
+    for d in dirs:
+        os.makedirs(os.path.join(repo_root, d), exist_ok=True)
+
+    # Write template files
+    files = {
+        ".gitignore": TEMPLATE_GITIGNORE,
+        "AGENTS.md": TEMPLATE_AGENTS_MD,
+        ".agents/skills/parts-lanes/SKILL.md": TEMPLATE_SKILL_MD,
+        ".agents/skills/parts-lanes/references/lane-protocol.md": TEMPLATE_LANE_PROTOCOL_MD,
+        ".parts/config.yaml": TEMPLATE_CONFIG_YAML,
+        ".codex/hooks.json": TEMPLATE_HOOKS_JSON,
+    }
+
+    for rel_path, content in files.items():
+        full_path = os.path.join(repo_root, rel_path)
+        with open(full_path, "w") as f:
+            f.write(content.lstrip("\n"))
+
+    # Copy the parts-lane script itself if running from another location
+    script_dest = os.path.join(repo_root, ".agents/skills/parts-lanes/scripts/parts-lane")
+    script_src = os.path.abspath(__file__)
+    if script_src != script_dest and os.path.isfile(script_src):
+        import shutil
+        os.makedirs(os.path.dirname(script_dest), exist_ok=True)
+        shutil.copy2(script_src, script_dest)
+        files[".agents/skills/parts-lanes/scripts/parts-lane"] = ""
+
+    # Make the script executable
+    if os.path.isfile(script_dest):
+        os.chmod(script_dest, 0o755)
+
+    print("Parts Lanes initialized.")
+    print()
+    print("Created files:")
+    for rel_path in files:
+        print(f"  {rel_path}")
+    print()
+    print("The parts-lane script is ready:")
+    print(f"  {script_dest}")
+    print()
+    print("Next steps:")
+    print("  1. Review and adjust .parts/config.yaml for your project")
+    print("  2. Run 'parts-lane begin' in each Codex thread or worktree")
+
+
+def _identify_lane(repo_root: str, store: LaneStore, hook_data: dict | None) -> str | None:
+    """Three-tier lane identification.
+
+    Returns lane_id or None if no lane found.
+    """
+    # Tier 1: Codex hook identity
+    if hook_data:
+        session_id, agent_id, cwd = HookHelper.get_thread_identity(hook_data)
+        if session_id:
+            lane_id = store.get_lane_by_thread(session_id, agent_id)
+            if lane_id:
+                return lane_id
+
+    # Tier 2: Git workspace identity
+    gh = GitHelper(repo_root)
+    branch = gh.current_branch()
+    if branch:
+        lane_id = store.get_lane_by_branch(branch)
+        if lane_id:
+            return lane_id
+
+    worktree = gh.current_worktree_path()
+    if worktree and worktree != repo_root:
+        lane_id = store.get_lane_by_worktree(worktree)
+        if lane_id:
+            return lane_id
+
+    # Tier 3: Local fallback
+    cwd = os.getcwd()
+    lane_id = store.get_cwd_fallback(cwd)
+    if lane_id:
+        return lane_id
+
+    return None
+
+
+def cmd_current(args, repo_root: str):
+    """Identify the current lane."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if lane_id is None:
+        die("No lane found. Run `parts-lane begin` to create one.", 1)
+
+    lane = store.get_lane(lane_id)
+    if lane is None:
+        die(f"Lane {lane_id} not found in database.", 1)
+
+    claims = store.get_claims(lane_id)
+    observed = store.get_observed_files(lane_id)
+
+    if getattr(args, "json", False):
+        output = {
+            "lane_id": lane["id"],
+            "state": lane["state"],
+            "task_summary": lane["task_summary"],
+            "task_revision": lane["task_revision"],
+            "branch": lane["branch"],
+            "worktree": lane["worktree"],
+            "claims": claims,
+            "observed_file_count": len(observed),
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"Lane: {lane['id']}")
+        print(f"State: {lane['state']}")
+        if lane["task_summary"]:
+            print(f"Task: {lane['task_summary']} (rev {lane['task_revision']})")
+        else:
+            print("Task: unset")
+        if lane["branch"]:
+            print(f"Branch: {lane['branch']}")
+        if lane["worktree"]:
+            print(f"Worktree: {lane['worktree']}")
+        if claims:
+            print(f"Claims ({len(claims)}):")
+            for c in claims:
+                print(f"  - {c}")
+        if observed:
+            print(f"Changed files ({len(observed)}):")
+            for o in observed:
+                print(f"  - {o['path']}")
+
+    store.close()
+
+
+def cmd_begin(args, repo_root: str):
+    """Create a new lane for the current thread/worktree."""
+    store = LaneStore(repo_root)
+    gh = GitHelper(repo_root)
+    config = PartsConfig(repo_root)
+    hook_data = HookHelper.parse()
+
+    branch = gh.current_branch()
+    worktree = gh.current_worktree_path()
+
+    # Check for shared checkout warning
+    if not getattr(args, "worktree", False):
+        if branch and config.is_protected_branch(branch):
+            print(f"Warning: You are on protected branch '{branch}'.")
+            print("Consider creating a worktree lane with --worktree.")
+            print()
+
+        # Check for multiple active threads in same directory
+        active_lanes = store.list_lanes(active_only=True)
+        cwd = os.getcwd()
+        same_dir_lanes = []
+        for lane in active_lanes:
+            wt = lane.get("worktree", "")
+            if not wt or cwd.startswith(wt):
+                if lane.get("branch") == branch:
+                    same_dir_lanes.append(lane)
+
+        if len(same_dir_lanes) >= 1:
+            print("Warning: Multiple active lanes detected in this checkout.")
+            print("Consider creating a worktree lane to isolate your work:")
+            print("  parts-lane begin --worktree")
+            print()
+
+    # Generate lane ID (use existing lane if already on a matching branch/worktree)
+    lane_id = None
+    if branch and branch.startswith(config.branch_prefix):
+        lane_id = store.get_lane_by_branch(branch)
+    if not lane_id and worktree != repo_root:
+        lane_id = store.get_lane_by_worktree(worktree)
+
+    if not lane_id:
+        lane_id = store.next_lane_id()
+
+    # Create worktree if requested
+    if getattr(args, "worktree", False):
+        wt_branch = f"{config.branch_prefix}{lane_id}"
+        wt_path = os.path.join(repo_root, config.worktree_root, lane_id)
+
+        # Create branch if not exists
+        existing_branch = gh._run("rev-parse", "--verify", wt_branch)
+        if not existing_branch:
+            gh._run("branch", wt_branch, capture=False)
+
+        # Create worktree
+        os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+        gh._run("worktree", "add", wt_path, wt_branch, capture=False)
+
+        worktree = wt_path
+        branch = wt_branch
+        print(f"Created worktree at: {wt_path}")
+        print(f"Branch: {wt_branch}")
+
+    # Create lane record
+    existing = store.get_lane(lane_id)
+    if existing:
+        if existing["state"] == "closed":
+            store.update_lane(lane_id, state="idle", updated_at=now_iso())
+        else:
+            print(f"Lane {lane_id} already exists and is {existing['state']}.")
+            store.close()
+            return
+    else:
+        session_id = None
+        agent_id = None
+        if hook_data:
+            session_id, agent_id, _ = HookHelper.get_thread_identity(hook_data)
+
+        store.create_lane(
+            lane_id=lane_id,
+            branch=branch,
+            worktree=worktree,
+            session_id=session_id,
+            agent_id=agent_id,
+        )
+
+    # Bind thread if hook data available
+    if hook_data:
+        session_id, agent_id, cwd = HookHelper.get_thread_identity(hook_data)
+        if session_id:
+            store.bind_thread(session_id, lane_id, cwd, agent_id)
+
+    # Set cwd fallback
+    store.set_cwd_fallback(os.getcwd(), lane_id)
+
+    store.add_event(lane_id, "lane_created")
+
+    print(f"Lane {lane_id} attached to this thread.")
+    print("Task: unset.")
+    print("Before editing, set a task with:")
+    print(f"  parts-lane task set \"<summary>\"")
+
+    store.close()
+
+
+def cmd_status(args, repo_root: str):
+    """Show status of all active lanes."""
+    store = LaneStore(repo_root)
+    gh = GitHelper(repo_root)
+    config = PartsConfig(repo_root)
+    lanes = store.list_lanes(active_only=True)
+
+    if not lanes:
+        print("No active lanes.")
+        store.close()
+        return
+
+    repo_name = os.path.basename(repo_root)
+
+    # Compute stats
+    active_count = len(lanes)
+    ready_count = 0
+    blocked_count = 0
+    taskless_count = 0
+    collision_count = 0
+
+    lane_details = []
+    for lane in lanes:
+        lid = lane["id"]
+        claims = store.get_claims(lid)
+        observed = store.get_observed_files(lid)
+        diff_hash = store.get_observed_diff_hash(lid)
+        latest_check_hash = store.get_latest_check_diff_hash(lid)
+
+        # Determine ready (simplified: can just check ready command logic)
+        is_ready = False
+        is_blocked = False
+
+        if lane["task_summary"] is None:
+            taskless_count += 1
+
+        # Check for claim conflicts
+        if claims:
+            conflicts = ClaimEngine.find_claim_conflicts(lid, claims, store)
+            if conflicts:
+                is_blocked = True
+                blocked_count += 1
+                collision_count += len(conflicts)
+
+        if not is_blocked:
+            # Rough ready estimation: task set + no conflicts + checks current
+            if lane["task_summary"] and diff_hash and latest_check_hash == diff_hash:
+                check_results = store.get_checks_for_hash(lid, diff_hash)
+                if check_results and all(c["status"] == "pass" for c in check_results):
+                    is_ready = True
+                    ready_count += 1
+
+        lane_details.append({
+            "lane": lane,
+            "claims": claims,
+            "observed": observed,
+            "is_ready": is_ready,
+            "is_blocked": is_blocked,
+            "conflicts": conflicts if is_blocked else [],
+        })
+
+    # Print summary
+    print(f"Parts Lanes -- {repo_name}")
+    print()
+    summary_parts = [f"Active lanes: {active_count}"]
+    if ready_count:
+        summary_parts.append(f"Ready: {ready_count}")
+    if blocked_count:
+        summary_parts.append(f"Blocked: {blocked_count}")
+    if taskless_count:
+        summary_parts.append(f"Task unset: {taskless_count}")
+    if collision_count:
+        summary_parts.append(f"Collisions: {collision_count}")
+    print(" | ".join(summary_parts))
+    print()
+
+    for detail in lane_details:
+        lane = detail["lane"]
+        claims = detail["claims"]
+        observed = detail["observed"]
+
+        status_line = f"{lane['id']}"
+        if lane["task_summary"]:
+            status_line += f"  {lane['task_summary']}"
+        else:
+            status_line += "  Untitled"
+        print(status_line)
+
+        if lane["session_id"]:
+            print(f"  thread: {lane['session_id']}")
+        if lane["branch"]:
+            print(f"  branch: {lane['branch']}")
+
+        if lane["task_summary"]:
+            print(f"  task: {lane['task_summary']}")
+
+        if claims:
+            claim_str = ", ".join(claims)
+            print(f"  claim: {claim_str}")
+        else:
+            print("  claim: none")
+
+        if observed:
+            print(f"  changed: {len(observed)} files")
+        else:
+            print("  changed: 0 files")
+
+        if detail["is_blocked"]:
+            for conf in detail["conflicts"]:
+                print(f"  blocked by: {conf['conflicting_lane_id']} claims {conf['conflicting_pattern']}")
+
+        gate_status = "pending"
+        if detail["is_ready"]:
+            gate_status = "pass"
+        elif detail["is_blocked"]:
+            gate_status = "blocked"
+        elif observed:
+            gate_status = "needs check"
+
+        print(f"  gate: {gate_status}")
+        print(f"  ready: {'yes' if detail['is_ready'] else 'no'}")
+        print()
+
+    store.close()
+
+
+def cmd_close(args, repo_root: str):
+    """Close a lane."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+
+    lane_id = getattr(args, "lane_id", None)
+    if not lane_id:
+        lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane specified and no current lane found.", 1)
+
+    lane = store.get_lane(lane_id)
+    if not lane:
+        die(f"Lane {lane_id} not found.", 1)
+
+    store.close_lane(lane_id)
+    store.add_event(lane_id, "lane_closed")
+    print(f"Lane {lane_id} closed.")
+    store.close()
+
+
+def cmd_task_set(args, repo_root: str):
+    """Set the task for the current lane."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    lane = store.get_lane(lane_id)
+    if lane and lane["task_summary"] and not getattr(args, "force", False):
+        die(
+            f"Lane {lane_id} already has a task: '{lane['task_summary']}'.\n"
+            f"Use 'parts-lane task update' to change it, or --force to overwrite.",
+            1,
+        )
+
+    summary = " ".join(args.summary)
+    store.update_lane(lane_id, task_summary=summary, task_revision=1, state="active")
+    store.add_event(lane_id, "task_set", {"summary": summary})
+    print(f"Task set for Lane {lane_id}: {summary}")
+    store.close()
+
+
+def cmd_task_update(args, repo_root: str):
+    """Update the task for the current lane."""
+    store = LaneStore(repo_root)
+    config = PartsConfig(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    lane = store.get_lane(lane_id)
+    if not lane or not lane["task_summary"]:
+        die("No task set yet. Use 'parts-lane task set' first.", 1)
+
+    old_summary = lane["task_summary"]
+    new_summary = " ".join(args.summary)
+    new_rev = lane["task_revision"] + 1
+
+    store.update_lane(lane_id, task_summary=new_summary, task_revision=new_rev)
+    store.add_event(lane_id, "task_updated", {
+        "from": old_summary, "to": new_summary, "revision": new_rev,
+    })
+
+    print(f"Task updated for Lane {lane_id}:")
+    print(f"  Old: {old_summary}")
+    print(f"  New: {new_summary}")
+    print(f"  Revision: {new_rev}")
+
+    if new_rev > config.scope_drift_warning_revision:
+        print(f"  Warning: task has been changed {new_rev} times. Consider whether claim scope is still appropriate.")
+
+    print("  Claims unchanged. If new files are needed, run `parts-lane claim-add`.")
+
+    store.close()
+
+
+def cmd_claim(args, repo_root: str):
+    """Claim file paths for the current lane."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    lane = store.get_lane(lane_id)
+    if not lane or not lane["task_summary"]:
+        print("Warning: Lane has no task set. Consider setting a task before claiming paths.")
+
+    patterns = list(args.patterns)
+
+    # Validate each pattern
+    for p in patterns:
+        valid, reason = ClaimEngine.validate_pattern(p)
+        if not valid:
+            print(f"Claim rejected:\n  {reason}")
+            sys.exit(3)
+
+    # Check for conflicts
+    conflicts = ClaimEngine.find_claim_conflicts(lane_id, patterns, store)
+    if conflicts:
+        print("Claim rejected.")
+        print()
+        print("Your claim:")
+        for p in patterns:
+            print(f"  {p}")
+        print()
+        print("Conflicts with:")
+        for c in conflicts:
+            print(f"  {c['conflicting_lane_id']}")
+            print(f"  claim: {c['conflicting_pattern']}")
+            print()
+        print("Suggested actions:")
+        print("  - narrow your claim")
+        print("  - wait for the conflicting lane to complete")
+        print("  - ask the user whether to override")
+        store.close()
+        sys.exit(3)
+
+    # Accept claims
+    for p in patterns:
+        store.add_claim(lane_id, p)
+
+    store.add_event(lane_id, "claims_set", {"patterns": list(patterns)})
+    print(f"Claim accepted for {lane_id}:")
+    for p in patterns:
+        print(f"  {p}")
+
+    store.close()
+
+
+def cmd_claim_add(args, repo_root: str):
+    """Add additional claim patterns for the current lane."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    existing_claims = store.get_claims(lane_id)
+    new_patterns = list(args.patterns)
+
+    # Validate new patterns
+    for p in new_patterns:
+        valid, reason = ClaimEngine.validate_pattern(p)
+        if not valid:
+            print(f"Claim rejected:\n  {reason}")
+            sys.exit(3)
+
+    # Check for conflicts (against other lanes, not own)
+    conflicts = ClaimEngine.find_claim_conflicts(lane_id, new_patterns, store)
+    if conflicts:
+        print("Claim rejected.")
+        print()
+        print("Your new claim:")
+        for p in new_patterns:
+            print(f"  {p}")
+        print()
+        print("Conflicts with:")
+        for c in conflicts:
+            print(f"  {c['conflicting_lane_id']}")
+            print(f"  claim: {c['conflicting_pattern']}")
+            print()
+        store.close()
+        sys.exit(3)
+
+    # Add claims
+    for p in new_patterns:
+        store.add_claim(lane_id, p)
+
+    store.add_event(lane_id, "claims_added", {"patterns": list(new_patterns)})
+
+    all_claims = existing_claims + new_patterns
+    print(f"Claims updated for {lane_id}:")
+    for c in all_claims:
+        print(f"  {c}")
+
+    store.close()
+
+
+def cmd_sync(args, repo_root: str):
+    """Sync actual git diff to lane state."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    gh = GitHelper(repo_root)
+    files = gh.diff_files()
+    diff_hash = gh.diff_hash()
+
+    store.set_observed_files(lane_id, files, diff_hash)
+    store.add_event(lane_id, "synced", {
+        "diff_hash": diff_hash, "file_count": len(files),
+    })
+
+    if getattr(args, "soft", False):
+        print(f"Synced: {len(files)} files changed, diff hash: {diff_hash[:8]}")
+    else:
+        print(f"Lane: {lane_id}")
+        print(f"Changed files:")
+        for f in files:
+            print(f"  {f}")
+        if not files:
+            print("  (none)")
+        print(f"Diff hash: {diff_hash[:12]}")
+
+    store.close()
+
+
+def cmd_gate(args, repo_root: str):
+    """Run gate checks on the current lane."""
+    store = LaneStore(repo_root)
+    config = PartsConfig(repo_root)
+    gh = GitHelper(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    lane = store.get_lane(lane_id)
+    claims = store.get_claims(lane_id)
+    observed = store.get_observed_files(lane_id)
+    diff_hash = store.get_observed_diff_hash(lane_id)
+
+    failures = []
+    warnings = []
+    soft = getattr(args, "soft", False)
+
+    # 1. Not on protected branch
+    branch = lane.get("branch", "") if lane else ""
+    if branch and config.is_protected_branch(branch):
+        failures.append(f"on protected branch: {branch}")
+
+    # 2. No claim conflict
+    if claims:
+        claim_conflicts = ClaimEngine.find_claim_conflicts(lane_id, claims, store)
+        if claim_conflicts:
+            for cc in claim_conflicts:
+                failures.append(
+                    f"claim conflict: {cc['your_pattern']} overlaps with "
+                    f"{cc['conflicting_lane_id']} claim {cc['conflicting_pattern']}"
+                )
+
+    # 3. Changes within claims
+    if claims and observed:
+        for obs in observed:
+            if not ClaimEngine.path_within_claims(obs["path"], claims):
+                failures.append(f"changed outside claim: {obs['path']}")
+
+    # 4. No actual file overlap
+    if observed:
+        overlaps = ClaimEngine.find_observed_overlap(lane_id, store)
+        for ol in overlaps:
+            failures.append(
+                f"actual file overlap with {ol['other_lane_id']}: {ol['overlapping_file']}"
+            )
+
+    # 5. No protected path changes
+    if observed:
+        for obs in observed:
+            if config.is_protected_path(obs["path"]):
+                failures.append(f"protected path changed: {obs['path']}")
+
+    # 6. High-risk path changes (warning only)
+    if observed:
+        for obs in observed:
+            if config.is_high_risk_path(obs["path"]):
+                warnings.append(f"high-risk path changed: {obs['path']}")
+
+    # 7. Checks run after latest diff
+    if observed:
+        latest_check_hash = store.get_latest_check_diff_hash(lane_id)
+        if latest_check_hash != diff_hash or not latest_check_hash:
+            failures.append("check has not run after latest diff")
+
+    if failures:
+        print("Gate failed:")
+        for f in failures:
+            print(f"  - {f}")
+    else:
+        print("Gate: passed")
+
+    if warnings:
+        print("Warnings:")
+        for w in warnings:
+            print(f"  - {w}")
+
+    if failures and not soft:
+        store.close()
+        sys.exit(1)
+
+    store.close()
+
+
+def cmd_check(args, repo_root: str):
+    """Run configured checks and record results."""
+    store = LaneStore(repo_root)
+    config = PartsConfig(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    config_checks = config.checks
+    if not config_checks:
+        print("No checks configured in .parts/config.yaml")
+        store.close()
+        return
+
+    diff_hash = store.get_observed_diff_hash(lane_id)
+    if not diff_hash:
+        print("Warning: no observed diff yet. Run `parts-lane sync` first.")
+
+    # If no sync done yet, use current diff
+    if not diff_hash:
+        gh = GitHelper(repo_root)
+        diff_hash = gh.diff_hash()
+
+    name_filter = getattr(args, "name", None)
+
+    passed = 0
+    failed = 0
+    results = []
+
+    for check_cfg in config_checks:
+        name = check_cfg.get("name", "unknown")
+        command = check_cfg.get("command", "")
+
+        if name_filter and name != name_filter:
+            continue
+
+        if not command:
+            print(f"Skipping {name}: no command configured")
+            continue
+
+        print(f"Running {name}: {command} ... ", end="", flush=True)
+
+        start = datetime.now(timezone.utc)
+        try:
+            result = subprocess.run(
+                command, shell=True, cwd=repo_root,
+                capture_output=True, text=True, timeout=300,
+            )
+            exit_code = result.returncode
+            stdout_tail = result.stdout[-500:] if len(result.stdout) > 500 else result.stdout
+            stderr_tail = result.stderr[-500:] if len(result.stderr) > 500 else result.stderr
+        except subprocess.TimeoutExpired:
+            exit_code = -1
+            stdout_tail = ""
+            stderr_tail = "Command timed out after 300s"
+        except Exception as e:
+            exit_code = -1
+            stdout_tail = ""
+            stderr_tail = str(e)
+
+        end = datetime.now(timezone.utc)
+        duration_ms = (end - start).total_seconds() * 1000
+        status = "pass" if exit_code == 0 else "fail"
+
+        store.add_check_result(
+            lane_id, name, command, exit_code, status,
+            duration_ms, diff_hash, stdout_tail, stderr_tail,
+        )
+        store.add_event(lane_id, "check_completed", {"name": name, "status": status})
+
+        if status == "pass":
+            print("passed", end="")
+            passed += 1
+        else:
+            print("failed", end="")
+            failed += 1
+
+        if duration_ms < 1000:
+            print(f" ({duration_ms:.0f}ms)")
+        else:
+            print(f" ({duration_ms/1000:.1f}s)")
+
+        results.append({"name": name, "status": status, "duration_ms": duration_ms})
+
+    total = passed + failed
+    print()
+    print(f"Checks: {passed}/{total} passed")
+    if failed > 0:
+        for r in results:
+            if r["status"] == "fail":
+                print(f"  - {r['name']} failed")
+
+    store.close()
+
+    if failed > 0:
+        sys.exit(1)
+
+
+def cmd_ready(args, repo_root: str):
+    """Check if the lane is ready to complete."""
+    store = LaneStore(repo_root)
+    config = PartsConfig(repo_root)
+    gh = GitHelper(repo_root)
+    hook_data = HookHelper.parse()
+    lane_id = _identify_lane(repo_root, store, hook_data)
+
+    if not lane_id:
+        die("No lane found. Run `parts-lane begin` first.", 1)
+
+    lane = store.get_lane(lane_id)
+    claims = store.get_claims(lane_id)
+    observed = store.get_observed_files(lane_id)
+    diff_hash = store.get_observed_diff_hash(lane_id)
+
+    reasons = []
+    warnings = []
+
+    # lane_exists
+    if not lane:
+        reasons.append("lane does not exist")
+    else:
+        # task_set
+        if not lane.get("task_summary"):
+            reasons.append("task not set")
+
+        # not_on_protected_branch
+        branch = lane.get("branch", "")
+        if branch and config.is_protected_branch(branch):
+            reasons.append(f"on protected branch: {branch}")
+
+        # no_claim_conflict
+        if claims:
+            claim_conflicts = ClaimEngine.find_claim_conflicts(lane_id, claims, store)
+            for cc in claim_conflicts:
+                reasons.append(
+                    f"claim conflict: {cc['your_pattern']} overlaps with "
+                    f"{cc['conflicting_lane_id']}"
+                )
+
+        # actual_changes_within_claim
+        if claims and observed:
+            for obs in observed:
+                if not ClaimEngine.path_within_claims(obs["path"], claims):
+                    reasons.append(f"changed file outside claim: {obs['path']}")
+
+        # no_actual_file_overlap
+        if observed:
+            overlaps = ClaimEngine.find_observed_overlap(lane_id, store)
+            for ol in overlaps:
+                reasons.append(
+                    f"actual file overlap with {ol['other_lane_id']}: {ol['overlapping_file']}"
+                )
+
+        # no_protected_path_change
+        if observed:
+            for obs in observed:
+                if config.is_protected_path(obs["path"]):
+                    reasons.append(f"protected path changed: {obs['path']}")
+
+        # checks_after_latest_diff
+        if observed and diff_hash:
+            latest_check_hash = store.get_latest_check_diff_hash(lane_id)
+            if latest_check_hash != diff_hash:
+                reasons.append("checks were run before latest diff")
+            else:
+                check_results = store.get_checks_for_hash(lane_id, diff_hash)
+                if not check_results:
+                    reasons.append("no checks run for current diff")
+                else:
+                    for c in check_results:
+                        if c["status"] != "pass":
+                            reasons.append(f"{c['name']} failed")
+        elif not observed:
+            reasons.append("no changes synced yet")
+
+        # scope drift warning
+        task_rev = lane.get("task_revision", 0)
+        if task_rev > config.scope_drift_warning_revision:
+            warnings.append(f"task has been revised {task_rev} times. Consider splitting this lane's scope.")
+
+    if getattr(args, "json", False):
+        output = {
+            "ready": len(reasons) == 0,
+            "lane_id": lane_id,
+            "reasons": reasons,
+            "warnings": warnings,
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        if reasons:
+            print("Ready: no")
+            print("Reasons:")
+            for r in reasons:
+                print(f"  - {r}")
+        else:
+            print("Ready: yes")
+            if lane:
+                print(f"Lane: {lane_id}")
+                print(f"Task: {lane.get('task_summary', 'unset')}")
+            if observed:
+                checks = store.get_checks_for_hash(lane_id, diff_hash)
+                passed = sum(1 for c in checks if c["status"] == "pass")
+                total = len(checks)
+                print(f"Checks: {passed}/{total} passed")
+            print("Gate: passed")
+
+        if warnings:
+            print("Warnings:")
+            for w in warnings:
+                print(f"  - {w}")
+
+    store.close()
+
+    if reasons:
+        sys.exit(1)
+
+
+def cmd_hook(args, repo_root: str):
+    """Handle Codex lifecycle hook events."""
+    store = LaneStore(repo_root)
+    hook_data = HookHelper.parse()
+    event = args.event
+
+    if hook_data is None and event not in ("session-start", "subagent-start"):
+        # For hooks that don't need stdin, just operate on the current lane
+        pass
+
+    if event == "session-start":
+        session_id = ""
+        if hook_data:
+            session_id, agent_id, cwd = HookHelper.get_thread_identity(hook_data)
+        else:
+            cwd = os.getcwd()
+
+        # Try to find lane
+        lane_id = _identify_lane(repo_root, store, hook_data)
+
+        if lane_id:
+            lane = store.get_lane(lane_id)
+            print(f"Current Parts Lane: {lane_id}")
+            if lane and lane["task_summary"]:
+                print(f"Task: {lane['task_summary']}")
+            else:
+                print("Task is not set yet. Before editing, call `parts-lane task set`.")
+        else:
+            # Create idle lane for the session
+            gh = GitHelper(repo_root)
+            worktree = gh.current_worktree_path()
+            if worktree != repo_root:
+                lane_id = store.create_lane(worktree=worktree)
+                if session_id:
+                    store.bind_thread(session_id, lane_id, cwd)
+                store.add_event(lane_id, "lane_created")
+                print(f"Lane {lane_id} created and attached.")
+                print("Task is not set yet. Before editing, call `parts-lane task set`.")
+            else:
+                print("No Lane found. Run `parts-lane begin` to create one.")
+
+    elif event == "subagent-start":
+        if hook_data:
+            session_id, agent_id, cwd = HookHelper.get_thread_identity(hook_data)
+            if session_id and agent_id:
+                # Create a new lane for the subagent
+                lane_id = store.create_lane()
+                store.bind_thread(session_id, lane_id, cwd, agent_id)
+                store.add_event(lane_id, "lane_created", {"subagent": agent_id})
+                print(f"Subagent Lane {lane_id} created for subagent {agent_id}.")
+            else:
+                print("Subagent started but no thread identity available.")
+        else:
+            print("Subagent started but no hook data available.")
+
+    elif event == "user-prompt-submit":
+        lane_id = _identify_lane(repo_root, store, hook_data)
+        if lane_id:
+            lane = store.get_lane(lane_id)
+            print(f"Current Lane: {lane_id}")
+            if lane and lane["task_summary"]:
+                print(f"Task: {lane['task_summary']}")
+            else:
+                print("This Lane has no task yet. Summarize the user's request and call `parts-lane task set` before editing.")
+        else:
+            print("No active Lane. Run `parts-lane begin` to create one.")
+
+    elif event == "post-edit":
+        # Auto-sync after edits
+        gh = GitHelper(repo_root)
+        lane_id = _identify_lane(repo_root, store, hook_data)
+        if lane_id:
+            files = gh.diff_files()
+            diff_hash = gh.diff_hash()
+            store.set_observed_files(lane_id, files, diff_hash)
+            print(f"Synced: {len(files)} files changed, diff hash: {diff_hash[:8]}")
+        else:
+            print("No active Lane to sync.")
+
+    elif event == "stop":
+        # Gate check on stop
+        lane_id = _identify_lane(repo_root, store, hook_data)
+        if lane_id:
+            config = PartsConfig(repo_root)
+            lane = store.get_lane(lane_id)
+            claims = store.get_claims(lane_id)
+            observed = store.get_observed_files(lane_id)
+            diff_hash = store.get_observed_diff_hash(lane_id)
+
+            issues = []
+
+            if lane and lane.get("branch") and config.is_protected_branch(lane["branch"]):
+                issues.append(f"on protected branch: {lane['branch']}")
+
+            if claims:
+                conflicts = ClaimEngine.find_claim_conflicts(lane_id, claims, store)
+                for cc in conflicts:
+                    issues.append(f"claim conflict with {cc['conflicting_lane_id']}")
+
+            if claims and observed:
+                for obs in observed:
+                    if not ClaimEngine.path_within_claims(obs["path"], claims):
+                        issues.append(f"changed outside claim: {obs['path']}")
+
+            if issues:
+                print("Gate issues detected:")
+                for i in issues:
+                    print(f"  - {i}")
+            else:
+                print("Gate: ok")
+        else:
+            print("No active Lane.")
+
+    store.close()
+
+
+# ============================================================================
+# ARGUMENT PARSER
+# ============================================================================
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="parts-lane",
+        description="Parts Lanes -- parallel development lane protocol for AI coding agents.",
+    )
+    sub = parser.add_subparsers(dest="command", help="Available commands")
+
+    # init
+    p_init = sub.add_parser("init", help="Initialize Parts Lanes in the repository")
+    p_init.add_argument("--skill", default="lanes", help="Skill type (default: lanes)")
+
+    # begin
+    p_begin = sub.add_parser("begin", help="Create or attach to a lane")
+    p_begin.add_argument("--worktree", action="store_true", help="Create a new git worktree for this lane")
+
+    # current
+    p_current = sub.add_parser("current", help="Identify the current lane")
+    p_current.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # status
+    p_status = sub.add_parser("status", help="Show all active lanes")
+    p_status.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # close
+    p_close = sub.add_parser("close", help="Close a lane")
+    p_close.add_argument("lane_id", nargs="?", help="Lane ID to close (defaults to current lane)")
+
+    # task set
+    p_task_set = sub.add_parser("task", help="Task management")
+    task_sub = p_task_set.add_subparsers(dest="task_command")
+
+    p_set = task_sub.add_parser("set", help="Set the lane task")
+    p_set.add_argument("summary", nargs="+", help="Task summary")
+    p_set.add_argument("--force", action="store_true", help="Overwrite existing task")
+
+    p_update = task_sub.add_parser("update", help="Update the lane task")
+    p_update.add_argument("summary", nargs="+", help="New task summary")
+
+    # claim
+    p_claim = sub.add_parser("claim", help="Claim file paths before editing")
+    p_claim.add_argument("patterns", nargs="+", help="Glob patterns to claim (e.g., src/auth/**)")
+
+    # claim-add
+    p_claim_add = sub.add_parser("claim-add", help="Add additional claim patterns")
+    p_claim_add.add_argument("patterns", nargs="+", help="Additional glob patterns to claim")
+
+    # sync
+    p_sync = sub.add_parser("sync", help="Sync actual git diff to lane state")
+    p_sync.add_argument("--soft", action="store_true", help="Update observed state only, no extra output")
+
+    # gate
+    p_gate = sub.add_parser("gate", help="Run gate checks")
+    p_gate.add_argument("--soft", action="store_true", help="Print warnings but exit 0")
+
+    # check
+    p_check = sub.add_parser("check", help="Run configured checks")
+    p_check.add_argument("--name", help="Run only the named check")
+
+    # ready
+    p_ready = sub.add_parser("ready", help="Check if lane is ready to complete")
+    p_ready.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # hook
+    p_hook = sub.add_parser("hook", help="Handle Codex lifecycle hook event")
+    p_hook.add_argument("event", choices=[
+        "session-start", "subagent-start", "user-prompt-submit", "post-edit", "stop",
+    ], help="Hook event name")
+
+    return parser
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+
+def main():
+    parser = build_argparser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    repo_root = get_repo_root()
+    if repo_root is None:
+        if args.command == "init":
+            repo_root = os.getcwd()
+            if not os.path.isdir(os.path.join(repo_root, ".git")):
+                subprocess.run(["git", "init"], cwd=repo_root, capture_output=True)
+        else:
+            die("Not in a git repository. Run `git init` or `parts-lane init` first.", 2)
+
+    # Dispatch
+    dispatch = {
+        "init": cmd_init,
+        "begin": cmd_begin,
+        "current": cmd_current,
+        "status": cmd_status,
+        "close": cmd_close,
+        "claim": cmd_claim,
+        "claim-add": cmd_claim_add,
+        "sync": cmd_sync,
+        "gate": cmd_gate,
+        "check": cmd_check,
+        "ready": cmd_ready,
+        "hook": cmd_hook,
+    }
+
+    # Handle `task set` and `task update`
+    if args.command == "task":
+        if args.task_command == "set":
+            cmd_task_set(args, repo_root)
+        elif args.task_command == "update":
+            cmd_task_update(args, repo_root)
+        else:
+            parser.print_help()
+            sys.exit(2)
+        return
+
+    func = dispatch.get(args.command)
+    if func:
+        func(args, repo_root)
+    else:
+        parser.print_help()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

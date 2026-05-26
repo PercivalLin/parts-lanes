@@ -1,0 +1,8 @@
+# Design documents (local only)
+parts_lanes_skill_design.md
+
+# Parts Lanes runtime state (not committed)
+.git/parts/
+
+# Parts worktrees (not committed)
+.parts/worktrees/

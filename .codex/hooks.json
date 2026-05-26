@@ -1,0 +1,62 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook session-start",
+            "statusMessage": "Attaching Parts Lane"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook subagent-start",
+            "statusMessage": "Creating Parts Lane for subagent"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook user-prompt-submit",
+            "statusMessage": "Checking current Parts Lane"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook post-edit",
+            "statusMessage": "Syncing Parts Lane diff"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/skills/parts-lanes/scripts/parts-lane hook stop",
+            "statusMessage": "Running Parts Lane gate"
+          }
+        ]
+      }
+    ]
+  }
+}
