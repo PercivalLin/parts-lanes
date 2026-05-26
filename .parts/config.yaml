@@ -29,12 +29,11 @@ high_risk_paths:
 
 checks:
   default:
-    - name: test
-      command: npm test
-    - name: typecheck
-      command: npm run typecheck
-    - name: lint
-      command: npm run lint
+    # Add project checks here, for example:
+    # - name: test
+    #   command: npm test
+    # - name: lint
+    #   command: npm run lint
 
 ready:
   require:

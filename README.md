@@ -27,51 +27,42 @@ Think of it as a set of conventions + a script, not a platform you sign up for.
 ## Installation
 
 ```bash
-# Clone into a temporary location
-git clone https://github.com/PercivalLin/parts-lanes.git /tmp/parts-lanes
+# Install into the current repository
+curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash
 
-# Copy the skill directory and config into your project
-cp -r /tmp/parts-lanes/.agents      your-project/
-cp    /tmp/parts-lanes/.codex        your-project/  # optional, for hook integration
-cp    /tmp/parts-lanes/.parts        your-project/  # optional, parts-lane init creates this
-
-# Make the script executable
-chmod +x your-project/.agents/skills/parts-lanes/scripts/parts-lane
-
-# Initialize Parts Lanes in your project
-cd your-project
-.agents/skills/parts-lanes/scripts/parts-lane init
+# Or specify a target directory
+curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s /path/to/your-project
 ```
 
-Or use the script directly without installing the skill:
+The installer downloads the zero-dependency `parts-lane` CLI, initializes the
+Codex skill and hooks, creates a local `./parts-lane` command, and avoids
+overwriting existing project files by default. Preview changes first with:
 
 ```bash
-python3 /path/to/parts-lane init
-python3 /path/to/parts-lane begin
-# ...
+curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s -- --dry-run /path/to/your-project
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Initialize Parts Lanes in your repo
-parts-lane init
+# 1. Check the installation
+./parts-lane doctor
 
-# 2. Start a new Lane
-parts-lane begin
+# 2. Start a new worktree Lane
+./parts-lane begin --worktree
 
 # 3. Tell it what you're doing
-parts-lane task set "Add rate limiting to login"
+./parts-lane task set "Add rate limiting to login"
 
 # 4. Claim the code you need
-parts-lane claim "src/auth/**" "tests/auth/**"
+./parts-lane claim "src/auth/**" "tests/auth/**"
 
 # 5. Edit files, then sync
-parts-lane sync
+./parts-lane sync
 
 # 6. Run checks before wrapping up
-parts-lane check
-parts-lane ready
+./parts-lane check
+./parts-lane ready
 ```
 
 That's it. Your agent now has a lane identity, declared claims, and verifiable completion status.
@@ -152,9 +143,10 @@ When an agent runs `parts-lane current`, the script identifies the lane through 
 
 | Command | Description |
 |---------|-------------|
-| `init` | Initialize Parts Lanes in a repository |
+| `init [--dry-run] [--force]` | Initialize Parts Lanes in a repository |
 | `begin [--worktree]` | Create or attach to a lane |
 | `current [--json]` | Identify the current lane |
+| `doctor` | Diagnose installation, hooks, worktrees, and lane state |
 | `task set <summary>` | Set the lane's task description |
 | `task update <summary>` | Change the task (increments revision counter) |
 | `claim <pattern> ...` | Claim file paths before editing |
@@ -188,12 +180,12 @@ high_risk_paths:           # Editing these triggers a warning
   - package-lock.json
   - migrations/**
 
-checks:                    # Commands run by `parts-lane check`
+checks:                    # Optional commands run by `parts-lane check`
   default:
-    - name: test
-      command: npm test
-    - name: lint
-      command: npm run lint
+    # - name: test
+    #   command: npm test
+    # - name: lint
+    #   command: npm run lint
 
 ready:                     # All must pass for `ready` to return yes
   require:
@@ -227,10 +219,11 @@ Check results are bound to a **diff hash**. If code changes after tests pass, th
 
 ### Setup
 
-`parts-lane init` writes these files:
+`./parts-lane init` writes or merges these files:
 
 ```
 repo/
+  parts-lane                          ← Local command shim
   AGENTS.md                          ← Codex reads this on startup
   .agents/skills/parts-lanes/
     SKILL.md                         ← Agent skill definition

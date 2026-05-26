@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -33,6 +34,12 @@ TEMPLATE_GITIGNORE = """\
 
 # Parts worktrees (not committed)
 .parts/worktrees/
+"""
+
+TEMPLATE_SHIM = """\
+#!/bin/sh
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$SCRIPT_DIR/.agents/skills/parts-lanes/scripts/parts-lane" "$@"
 """
 
 TEMPLATE_AGENTS_MD = """\
@@ -55,6 +62,9 @@ Required workflow:
 Never claim completion unless `parts-lane ready` reports ready.
 
 Do not directly edit Lane state files. Use the `parts-lane` script only.
+
+Use `./parts-lane` from the repository root when available; otherwise use
+`.agents/skills/parts-lanes/scripts/parts-lane`.
 """
 
 TEMPLATE_SKILL_MD = """\
@@ -87,13 +97,13 @@ Your goal is to complete the user's coding task while staying inside your own La
 Run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane current
+./parts-lane current
 ```
 
 If there is no Lane, run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane begin
+./parts-lane begin
 ```
 
 ### 2. Set or update the task
@@ -101,13 +111,13 @@ If there is no Lane, run:
 If the Lane has no task, summarize the user's instruction and run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane task set "<task summary>"
+./parts-lane task set "<task summary>"
 ```
 
 If the user changes the task, run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane task update "<new task summary>"
+./parts-lane task update "<new task summary>"
 ```
 
 ### 3. Claim paths before editing
@@ -115,7 +125,7 @@ If the user changes the task, run:
 After inspecting the repo, claim likely paths:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane claim "src/auth/**" "tests/auth/**"
+./parts-lane claim "src/auth/**" "tests/auth/**"
 ```
 
 If claim fails, stop and report the collision.
@@ -125,26 +135,26 @@ If claim fails, stop and report the collision.
 If you need another path, use:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane claim-add "new/path/**"
+./parts-lane claim-add "new/path/**"
 ```
 
 ### 5. Sync after editing
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane sync
+./parts-lane sync
 ```
 
 ### 6. Gate before progress
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane gate
+./parts-lane gate
 ```
 
 ### 7. Check and ready before completion
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane check
-.agents/skills/parts-lanes/scripts/parts-lane ready
+./parts-lane check
+./parts-lane ready
 ```
 
 Only claim completion if ready passes.
@@ -252,12 +262,11 @@ high_risk_paths:
 
 checks:
   default:
-    - name: test
-      command: npm test
-    - name: typecheck
-      command: npm run typecheck
-    - name: lint
-      command: npm run lint
+    # Add project checks here, for example:
+    # - name: test
+    #   command: npm test
+    # - name: lint
+    #   command: npm run lint
 
 ready:
   require:
@@ -342,16 +351,64 @@ TEMPLATE_HOOKS_JSON = """\
 
 
 def get_repo_root() -> str | None:
-    """Walk up from cwd to find the git repository root. Returns None if not in a repo."""
+    """Return the git worktree root, including linked git worktrees."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
     cwd = os.getcwd()
     while cwd != "/":
-        if os.path.isdir(os.path.join(cwd, ".git")):
+        if os.path.exists(os.path.join(cwd, ".git")):
             return cwd
         parent = os.path.dirname(cwd)
         if parent == cwd:
             break
         cwd = parent
     return None
+
+
+def get_git_common_dir(repo_root: str) -> str:
+    """Return the common .git directory shared by linked worktrees."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            path = result.stdout.strip()
+            if not os.path.isabs(path):
+                path = os.path.join(repo_root, path)
+            return os.path.abspath(path)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    git_path = os.path.join(repo_root, ".git")
+    if os.path.isdir(git_path):
+        return git_path
+    if os.path.isfile(git_path):
+        try:
+            with open(git_path) as f:
+                raw = f.read().strip()
+            if raw.startswith("gitdir:"):
+                path = raw.split(":", 1)[1].strip()
+                if not os.path.isabs(path):
+                    path = os.path.join(repo_root, path)
+                return os.path.abspath(path)
+        except OSError:
+            pass
+    return git_path
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -373,6 +430,123 @@ def compute_diff_hash(diff_binary: bytes) -> str:
 def match_pattern(path: str, pattern: str) -> bool:
     """Check if a file path matches a glob pattern."""
     return fnmatch.fnmatch(path, pattern)
+
+
+def ensure_trailing_newline(text: str) -> str:
+    return text if text.endswith("\n") else text + "\n"
+
+
+def write_text(path: str, content: str, *, dry_run: bool = False):
+    if dry_run:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write(ensure_trailing_newline(content.lstrip("\n")))
+
+
+def install_file(path: str, content: str, *, force: bool = False,
+                 dry_run: bool = False) -> str:
+    if os.path.exists(path) and not force:
+        return "kept"
+    action = "updated" if os.path.exists(path) else "created"
+    write_text(path, content, dry_run=dry_run)
+    return action
+
+
+def merge_gitignore(path: str, *, force: bool = False, dry_run: bool = False) -> str:
+    content = TEMPLATE_GITIGNORE.lstrip("\n")
+    if force or not os.path.exists(path):
+        return install_file(path, content, force=force, dry_run=dry_run)
+
+    with open(path) as f:
+        existing = f.read()
+    additions = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped not in {l.strip() for l in existing.splitlines()}:
+            additions.append(line)
+    if not additions:
+        return "unchanged"
+    merged = ensure_trailing_newline(existing)
+    if not merged.endswith("\n\n"):
+        merged += "\n"
+    merged += "# Parts Lanes runtime state (not committed)\n"
+    merged += "\n".join(additions) + "\n"
+    write_text(path, merged, dry_run=dry_run)
+    return "updated"
+
+
+def merge_agents_md(path: str, *, force: bool = False, dry_run: bool = False) -> str:
+    content = TEMPLATE_AGENTS_MD.lstrip("\n")
+    marker = "This repository uses Parts Lanes."
+    if force or not os.path.exists(path):
+        return install_file(path, content, force=force, dry_run=dry_run)
+
+    with open(path) as f:
+        existing = f.read()
+    if marker in existing or "parts-lanes:start" in existing:
+        return "unchanged"
+
+    block = f"""
+<!-- parts-lanes:start -->
+
+## Parts Lanes
+
+{content.split("# AGENTS.md", 1)[-1].strip()}
+
+<!-- parts-lanes:end -->
+"""
+    merged = ensure_trailing_newline(existing)
+    if not merged.endswith("\n\n"):
+        merged += "\n"
+    merged += block.lstrip("\n")
+    write_text(path, merged, dry_run=dry_run)
+    return "updated"
+
+
+def merge_hooks_json(path: str, *, force: bool = False, dry_run: bool = False) -> str:
+    content = TEMPLATE_HOOKS_JSON.lstrip("\n")
+    if force or not os.path.exists(path):
+        return install_file(path, content, force=force, dry_run=dry_run)
+
+    try:
+        with open(path) as f:
+            existing = json.load(f)
+        desired = json.loads(content)
+    except (json.JSONDecodeError, OSError):
+        return "kept"
+
+    existing_hooks = existing.setdefault("hooks", {})
+    changed = False
+    for event, entries in desired.get("hooks", {}).items():
+        current_entries = existing_hooks.setdefault(event, [])
+        current_commands = {
+            hook.get("command")
+            for entry in current_entries
+            for hook in entry.get("hooks", [])
+            if isinstance(hook, dict)
+        }
+        for entry in entries:
+            desired_commands = [
+                hook.get("command")
+                for hook in entry.get("hooks", [])
+                if isinstance(hook, dict)
+            ]
+            if any(cmd and cmd in current_commands for cmd in desired_commands):
+                continue
+            current_entries.append(entry)
+            changed = True
+
+    if not changed:
+        return "unchanged"
+    if not dry_run:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(existing, f, indent=2)
+            f.write("\n")
+    return "updated"
 
 
 # ============================================================================
@@ -630,6 +804,23 @@ class GitHelper:
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
             return ""
 
+    def _run_checked(self, *args: str) -> str:
+        """Run a git command and raise with stderr on failure."""
+        try:
+            result = subprocess.run(
+                ["git"] + list(args),
+                cwd=self._repo_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(str(e)) from e
+        if result.returncode != 0:
+            msg = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(msg or f"git {' '.join(args)} failed")
+        return result.stdout.rstrip("\n")
+
     def _run_bytes(self, *args: str) -> bytes:
         """Run a git command and return stdout as bytes."""
         try:
@@ -673,13 +864,39 @@ class GitHelper:
 
     def diff_files(self) -> list:
         """Return list of changed files from git diff."""
-        output = self._run("diff", "--name-only")
+        files = []
+        for args in (
+            ("diff", "--name-only"),
+            ("diff", "--cached", "--name-only"),
+            ("ls-files", "--others", "--exclude-standard"),
+        ):
+            output = self._run(*args)
+            if output:
+                files.extend(f for f in output.split("\n") if f)
+        return sorted(dict.fromkeys(files))
+
+    def untracked_files(self) -> list:
+        output = self._run("ls-files", "--others", "--exclude-standard")
         if not output:
             return []
         return [f for f in output.split("\n") if f]
 
     def diff_binary(self) -> bytes:
-        return self._run_bytes("diff", "--binary")
+        chunks = [
+            self._run_bytes("diff", "--binary"),
+            self._run_bytes("diff", "--cached", "--binary"),
+        ]
+        for rel_path in self.untracked_files():
+            full_path = os.path.join(self._repo_root, rel_path)
+            if not os.path.isfile(full_path):
+                continue
+            chunks.append(f"\n-- parts-lanes-untracked {rel_path}\n".encode())
+            try:
+                with open(full_path, "rb") as f:
+                    chunks.append(hashlib.sha256(f.read()).hexdigest().encode())
+            except OSError:
+                chunks.append(b"unreadable")
+        return b"".join(chunks)
 
     def diff_hash(self) -> str:
         """Compute SHA-256 of git diff --binary output."""
@@ -703,7 +920,7 @@ class LaneStore:
 
     def __init__(self, repo_root: str):
         self._repo_root = repo_root
-        self._db_dir = os.path.join(repo_root, ".git", "parts")
+        self._db_dir = os.path.join(get_git_common_dir(repo_root), "parts")
         os.makedirs(self._db_dir, exist_ok=True)
         self._db_path = os.path.join(self._db_dir, "state.sqlite")
         self._conn = sqlite3.connect(self._db_path)
@@ -1256,11 +1473,17 @@ class HookHelper:
 
 def cmd_init(args, repo_root: str):
     """Initialize Parts Lanes in the current repository."""
+    dry_run = getattr(args, "dry_run", False)
+    force = getattr(args, "force", False)
+
     # Ensure git repo exists
     git_dir = os.path.join(repo_root, ".git")
-    if not os.path.isdir(git_dir):
-        subprocess.run(["git", "init"], cwd=repo_root, capture_output=True)
-        print("Initialized git repository.")
+    if not os.path.exists(git_dir):
+        if not dry_run:
+            subprocess.run(["git", "init"], cwd=repo_root, capture_output=True)
+            print("Initialized git repository.")
+        else:
+            print("Would initialize git repository.")
 
     # Create directories
     dirs = [
@@ -1270,10 +1493,12 @@ def cmd_init(args, repo_root: str):
         ".codex",
     ]
     for d in dirs:
-        os.makedirs(os.path.join(repo_root, d), exist_ok=True)
+        if not dry_run:
+            os.makedirs(os.path.join(repo_root, d), exist_ok=True)
 
     # Write template files
     files = {
+        "parts-lane": TEMPLATE_SHIM,
         ".gitignore": TEMPLATE_GITIGNORE,
         "AGENTS.md": TEMPLATE_AGENTS_MD,
         ".agents/skills/parts-lanes/SKILL.md": TEMPLATE_SKILL_MD,
@@ -1282,36 +1507,59 @@ def cmd_init(args, repo_root: str):
         ".codex/hooks.json": TEMPLATE_HOOKS_JSON,
     }
 
+    actions = {}
     for rel_path, content in files.items():
         full_path = os.path.join(repo_root, rel_path)
-        with open(full_path, "w") as f:
-            f.write(content.lstrip("\n"))
+        if rel_path == ".gitignore":
+            actions[rel_path] = merge_gitignore(full_path, force=force, dry_run=dry_run)
+        elif rel_path == "AGENTS.md":
+            actions[rel_path] = merge_agents_md(full_path, force=force, dry_run=dry_run)
+        elif rel_path == ".codex/hooks.json":
+            actions[rel_path] = merge_hooks_json(full_path, force=force, dry_run=dry_run)
+        else:
+            actions[rel_path] = install_file(
+                full_path, content, force=force, dry_run=dry_run,
+            )
 
     # Copy the parts-lane script itself if running from another location
     script_dest = os.path.join(repo_root, ".agents/skills/parts-lanes/scripts/parts-lane")
     script_src = os.path.abspath(__file__)
     if script_src != script_dest and os.path.isfile(script_src):
-        import shutil
-        os.makedirs(os.path.dirname(script_dest), exist_ok=True)
-        shutil.copy2(script_src, script_dest)
-        files[".agents/skills/parts-lanes/scripts/parts-lane"] = ""
+        script_exists = os.path.exists(script_dest)
+        if force or not os.path.exists(script_dest):
+            if not dry_run:
+                os.makedirs(os.path.dirname(script_dest), exist_ok=True)
+                shutil.copy2(script_src, script_dest)
+            actions[".agents/skills/parts-lanes/scripts/parts-lane"] = (
+                "updated" if script_exists else "created"
+            )
+        else:
+            actions[".agents/skills/parts-lanes/scripts/parts-lane"] = "kept"
+    elif os.path.isfile(script_dest):
+        actions[".agents/skills/parts-lanes/scripts/parts-lane"] = "unchanged"
 
     # Make the script executable
-    if os.path.isfile(script_dest):
+    if os.path.isfile(script_dest) and not dry_run:
         os.chmod(script_dest, 0o755)
+    shim_dest = os.path.join(repo_root, "parts-lane")
+    if os.path.isfile(shim_dest) and not dry_run:
+        os.chmod(shim_dest, 0o755)
 
-    print("Parts Lanes initialized.")
+    if dry_run:
+        print("Parts Lanes init dry run.")
+    else:
+        print("Parts Lanes initialized.")
     print()
-    print("Created files:")
-    for rel_path in files:
-        print(f"  {rel_path}")
+    print("Files:")
+    for rel_path, action in actions.items():
+        print(f"  {action:9} {rel_path}")
     print()
-    print("The parts-lane script is ready:")
-    print(f"  {script_dest}")
+    print("Local command:")
+    print("  ./parts-lane")
     print()
     print("Next steps:")
-    print("  1. Review and adjust .parts/config.yaml for your project")
-    print("  2. Run 'parts-lane begin' in each Codex thread or worktree")
+    print("  1. Run './parts-lane doctor'")
+    print("  2. Run './parts-lane begin --worktree' in each Codex thread")
 
 
 def _identify_lane(repo_root: str, store: LaneStore, hook_data: dict | None) -> str | None:
@@ -1449,14 +1697,28 @@ def cmd_begin(args, repo_root: str):
         wt_branch = f"{config.branch_prefix}{lane_id}"
         wt_path = os.path.join(repo_root, config.worktree_root, lane_id)
 
+        if not gh._run("rev-parse", "--verify", "HEAD"):
+            die(
+                "Cannot create a worktree before the repository has an initial "
+                "commit. Make one commit first, or run `./parts-lane begin` "
+                "in the main checkout.",
+                2,
+            )
+
+        if os.path.exists(wt_path):
+            die(f"Worktree path already exists: {wt_path}", 2)
+
         # Create branch if not exists
         existing_branch = gh._run("rev-parse", "--verify", wt_branch)
-        if not existing_branch:
-            gh._run("branch", wt_branch, capture=False)
+        try:
+            if not existing_branch:
+                gh._run_checked("branch", wt_branch)
 
-        # Create worktree
-        os.makedirs(os.path.dirname(wt_path), exist_ok=True)
-        gh._run("worktree", "add", wt_path, wt_branch, capture=False)
+            # Create worktree
+            os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+            gh._run_checked("worktree", "add", wt_path, wt_branch)
+        except RuntimeError as e:
+            die(f"Could not create worktree: {e}", 2)
 
         worktree = wt_path
         branch = wt_branch
@@ -1912,7 +2174,7 @@ def cmd_gate(args, repo_root: str):
                 warnings.append(f"high-risk path changed: {obs['path']}")
 
     # 7. Checks run after latest diff
-    if observed:
+    if observed and config.checks:
         latest_check_hash = store.get_latest_check_diff_hash(lane_id)
         if latest_check_hash != diff_hash or not latest_check_hash:
             failures.append("check has not run after latest diff")
@@ -1948,7 +2210,7 @@ def cmd_check(args, repo_root: str):
 
     config_checks = config.checks
     if not config_checks:
-        print("No checks configured in .parts/config.yaml")
+        print("No checks configured in .parts/config.yaml; skipping.")
         store.close()
         return
 
@@ -2098,7 +2360,7 @@ def cmd_ready(args, repo_root: str):
                     reasons.append(f"protected path changed: {obs['path']}")
 
         # checks_after_latest_diff
-        if observed and diff_hash:
+        if observed and diff_hash and config.checks:
             latest_check_hash = store.get_latest_check_diff_hash(lane_id)
             if latest_check_hash != diff_hash:
                 reasons.append("checks were run before latest diff")
@@ -2137,11 +2399,13 @@ def cmd_ready(args, repo_root: str):
             if lane:
                 print(f"Lane: {lane_id}")
                 print(f"Task: {lane.get('task_summary', 'unset')}")
-            if observed:
+            if observed and config.checks:
                 checks = store.get_checks_for_hash(lane_id, diff_hash)
                 passed = sum(1 for c in checks if c["status"] == "pass")
                 total = len(checks)
                 print(f"Checks: {passed}/{total} passed")
+            elif observed:
+                print("Checks: not configured")
             print("Gate: passed")
 
         if warnings:
@@ -2152,6 +2416,104 @@ def cmd_ready(args, repo_root: str):
     store.close()
 
     if reasons:
+        sys.exit(1)
+
+
+def cmd_doctor(args, repo_root: str):
+    """Diagnose installation, hooks, state, and active lanes."""
+    store = LaneStore(repo_root)
+    gh = GitHelper(repo_root)
+    failures = []
+    warnings = []
+
+    def record(level: str, message: str):
+        if level == "FAIL":
+            failures.append(message)
+        elif level == "WARN":
+            warnings.append(message)
+        print(f"{level:4} {message}")
+
+    print("Parts Lanes doctor")
+    print(f"Repo: {repo_root}")
+    print(f"State: {store._db_path}")
+    print()
+
+    if os.path.exists(os.path.join(repo_root, ".git")):
+        record("OK", "git repository detected")
+    else:
+        record("FAIL", "no .git entry found at repo root")
+
+    script_path = os.path.join(repo_root, ".agents/skills/parts-lanes/scripts/parts-lane")
+    if os.path.isfile(script_path):
+        record("OK", "parts-lane script installed")
+        if not os.access(script_path, os.X_OK):
+            record("WARN", "parts-lane script is not executable")
+    else:
+        record("FAIL", "parts-lane script is missing")
+
+    shim_path = os.path.join(repo_root, "parts-lane")
+    if os.path.isfile(shim_path):
+        record("OK", "local ./parts-lane command installed")
+        if not os.access(shim_path, os.X_OK):
+            record("WARN", "./parts-lane is not executable")
+    else:
+        record("WARN", "local ./parts-lane command is missing; run init again to create it")
+
+    config_path = os.path.join(repo_root, ".parts/config.yaml")
+    if os.path.isfile(config_path):
+        record("OK", ".parts/config.yaml found")
+    else:
+        record("FAIL", ".parts/config.yaml is missing")
+
+    hooks_path = os.path.join(repo_root, ".codex/hooks.json")
+    if os.path.isfile(hooks_path):
+        try:
+            with open(hooks_path) as f:
+                hooks = json.load(f)
+            hook_text = json.dumps(hooks)
+            if "parts-lane hook" in hook_text:
+                record("OK", "Codex hooks include Parts Lanes")
+            else:
+                record("WARN", "Codex hooks file exists but does not reference Parts Lanes")
+        except (json.JSONDecodeError, OSError):
+            record("FAIL", ".codex/hooks.json is not valid JSON")
+    else:
+        record("WARN", ".codex/hooks.json is missing")
+
+    current_lane = _identify_lane(repo_root, store, HookHelper.parse())
+    if current_lane:
+        record("OK", f"current lane detected: {current_lane}")
+    else:
+        record("WARN", "no current lane detected")
+
+    active_lanes = store.list_lanes(active_only=True)
+    if active_lanes:
+        record("OK", f"{len(active_lanes)} active lane(s) in state")
+    else:
+        record("WARN", "no active lanes in state")
+
+    for lane in active_lanes:
+        lane_id = lane["id"]
+        branch = lane.get("branch")
+        worktree = lane.get("worktree")
+        if branch and not gh._run("rev-parse", "--verify", branch):
+            record("WARN", f"{lane_id} branch is missing: {branch}")
+        if worktree and not os.path.isdir(worktree):
+            record("FAIL", f"{lane_id} worktree is missing: {worktree}")
+        claims = store.get_claims(lane_id)
+        if lane.get("task_summary") and not claims:
+            record("WARN", f"{lane_id} has a task but no claims")
+
+    print()
+    if failures:
+        print(f"Doctor: {len(failures)} failure(s), {len(warnings)} warning(s)")
+    elif warnings:
+        print(f"Doctor: ok with {len(warnings)} warning(s)")
+    else:
+        print("Doctor: ok")
+
+    store.close()
+    if failures:
         sys.exit(1)
 
 
@@ -2286,6 +2648,8 @@ def build_argparser() -> argparse.ArgumentParser:
     # init
     p_init = sub.add_parser("init", help="Initialize Parts Lanes in the repository")
     p_init.add_argument("--skill", default="lanes", help="Skill type (default: lanes)")
+    p_init.add_argument("--dry-run", action="store_true", help="Show planned changes without writing files")
+    p_init.add_argument("--force", action="store_true", help="Overwrite existing managed files")
 
     # begin
     p_begin = sub.add_parser("begin", help="Create or attach to a lane")
@@ -2338,6 +2702,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p_ready = sub.add_parser("ready", help="Check if lane is ready to complete")
     p_ready.add_argument("--json", action="store_true", help="Output as JSON")
 
+    # doctor
+    sub.add_parser("doctor", help="Diagnose installation and lane state")
+
     # hook
     p_hook = sub.add_parser("hook", help="Handle Codex lifecycle hook event")
     p_hook.add_argument("event", choices=[
@@ -2364,7 +2731,10 @@ def main():
     if repo_root is None:
         if args.command == "init":
             repo_root = os.getcwd()
-            if not os.path.isdir(os.path.join(repo_root, ".git")):
+            if (
+                not os.path.exists(os.path.join(repo_root, ".git"))
+                and not getattr(args, "dry_run", False)
+            ):
                 subprocess.run(["git", "init"], cwd=repo_root, capture_output=True)
         else:
             die("Not in a git repository. Run `git init` or `parts-lane init` first.", 2)
@@ -2382,6 +2752,7 @@ def main():
         "gate": cmd_gate,
         "check": cmd_check,
         "ready": cmd_ready,
+        "doctor": cmd_doctor,
         "hook": cmd_hook,
     }
 

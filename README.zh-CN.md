@@ -29,51 +29,41 @@ Parts Lanes 是一个 **Codex Agent Skill**，附带一个 CLI 工具。它以�
 ## 安装
 
 ```bash
-# 克隆到临时目录
-git clone https://github.com/PercivalLin/parts-lanes.git /tmp/parts-lanes
+# 安装到当前仓库
+curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash
 
-# 把 skill 目录和配置复制到你的项目中
-cp -r /tmp/parts-lanes/.agents      你的项目/
-cp    /tmp/parts-lanes/.codex        你的项目/  # 可选，用于 hook 集成
-cp    /tmp/parts-lanes/.parts        你的项目/  # 可选，parts-lane init 会自动创建
-
-# 赋予脚本执行权限
-chmod +x 你的项目/.agents/skills/parts-lanes/scripts/parts-lane
-
-# 在项目中初始化 Parts Lanes
-cd 你的项目
-.agents/skills/parts-lanes/scripts/parts-lane init
+# 或者指定目标目录
+curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s /path/to/你的项目
 ```
 
-或者不安装 skill，直接使用脚本：
+安装器会下载零依赖的 `parts-lane` CLI，初始化 Codex skill 和 hooks，
+创建本地 `./parts-lane` 命令，并且默认不覆盖项目里已有的文件。想先预览：
 
 ```bash
-python3 /path/to/parts-lane init
-python3 /path/to/parts-lane begin
-# ...
+curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s -- --dry-run /path/to/你的项目
 ```
 
 ## 快速开始
 
 ```bash
-# 1. 在仓库里初始化 Parts Lanes
-parts-lane init
+# 1. 检查安装状态
+./parts-lane doctor
 
-# 2. 开一个新 Lane
-parts-lane begin
+# 2. 开一个新的 worktree Lane
+./parts-lane begin --worktree
 
 # 3. 告诉它你要做什么
-parts-lane task set "给登录加限流"
+./parts-lane task set "给登录加限流"
 
 # 4. 声明你要改的代码
-parts-lane claim "src/auth/**" "tests/auth/**"
+./parts-lane claim "src/auth/**" "tests/auth/**"
 
 # 5. 改完代码后同步
-parts-lane sync
+./parts-lane sync
 
 # 6. 完成前过闸检查
-parts-lane check
-parts-lane ready
+./parts-lane check
+./parts-lane ready
 ```
 
 就这样。你的 agent 现在有了身份、声明了代码占用、有了可验证的完成状态。
@@ -154,9 +144,10 @@ Git 会在 merge 时发现文件级冲突。但到那时候两边都已经干完
 
 | 命令 | 说明 |
 |------|------|
-| `init` | 在仓库中初始化 Parts Lanes |
+| `init [--dry-run] [--force]` | 在仓库中初始化 Parts Lanes |
 | `begin [--worktree]` | 创建或接入一个 Lane |
 | `current [--json]` | 识别当前 Lane |
+| `doctor` | 诊断安装、hooks、worktree 和 Lane 状态 |
 | `task set <摘要>` | 设置 Lane 的任务 |
 | `task update <摘要>` | 修改任务（递增修订计数） |
 | `claim <pattern> ...` | 修改代码前声明文件路径 |
@@ -190,12 +181,12 @@ high_risk_paths:           # 修改这些路径触发警告
   - package-lock.json
   - migrations/**
 
-checks:                    # parts-lane check 会执行的命令
+checks:                    # parts-lane check 可执行的命令
   default:
-    - name: test
-      command: npm test
-    - name: lint
-      command: npm run lint
+    # - name: test
+    #   command: npm test
+    # - name: lint
+    #   command: npm run lint
 
 ready:                     # 全部通过才算 ready
   require:
@@ -229,10 +220,11 @@ thread_bindings  — session_id, agent_id → lane_id
 
 ### 安装
 
-`parts-lane init` 会写入这些文件：
+`./parts-lane init` 会写入或合并这些文件：
 
 ```
 repo/
+  parts-lane                          ← 本地命令入口
   AGENTS.md                          ← Codex 启动时读取
   .agents/skills/parts-lanes/
     SKILL.md                         ← Agent skill 定义

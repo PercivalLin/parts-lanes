@@ -27,13 +27,13 @@ Your goal is to complete the user's coding task while staying inside your own La
 Run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane current
+./parts-lane current
 ```
 
 If there is no Lane, run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane begin
+./parts-lane begin
 ```
 
 ### 2. Set or update the task
@@ -41,13 +41,13 @@ If there is no Lane, run:
 If the Lane has no task, summarize the user's instruction and run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane task set "<task summary>"
+./parts-lane task set "<task summary>"
 ```
 
 If the user changes the task, run:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane task update "<new task summary>"
+./parts-lane task update "<new task summary>"
 ```
 
 ### 3. Claim paths before editing
@@ -55,7 +55,7 @@ If the user changes the task, run:
 After inspecting the repo, claim likely paths:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane claim "src/auth/**" "tests/auth/**"
+./parts-lane claim "src/auth/**" "tests/auth/**"
 ```
 
 If claim fails, stop and report the collision.
@@ -65,26 +65,26 @@ If claim fails, stop and report the collision.
 If you need another path, use:
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane claim-add "new/path/**"
+./parts-lane claim-add "new/path/**"
 ```
 
 ### 5. Sync after editing
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane sync
+./parts-lane sync
 ```
 
 ### 6. Gate before progress
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane gate
+./parts-lane gate
 ```
 
 ### 7. Check and ready before completion
 
 ```bash
-.agents/skills/parts-lanes/scripts/parts-lane check
-.agents/skills/parts-lanes/scripts/parts-lane ready
+./parts-lane check
+./parts-lane ready
 ```
 
 Only claim completion if ready passes.
@@ -97,3 +97,6 @@ Only claim completion if ready passes.
 - Do not claim tests passed unless `parts-lane check` recorded them after the latest diff.
 - Do not directly edit `.git/parts` state.
 - Do not delete or modify another Lane.
+
+Use `./parts-lane` from the repository root when available; otherwise use
+`.agents/skills/parts-lanes/scripts/parts-lane`.
