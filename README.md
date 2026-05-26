@@ -1,12 +1,16 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
-  <img src="https://img.shields.io/badge/python-3.9%2B-green.svg" alt="Python">
-  <img src="https://img.shields.io/badge/dependencies-zero-brightgreen.svg" alt="Dependencies">
-</p>
+<div align="center">
 
-# Parts Lanes
+<img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
+<img src="https://img.shields.io/badge/python-3.9%2B-green.svg" alt="Python">
+<img src="https://img.shields.io/badge/dependencies-zero-brightgreen.svg" alt="Dependencies">
+
+<h1>Parts Lanes</h1>
+
+[English](README.md) | [中文](README.zh-CN.md)
 
 > A parallel development lane protocol for AI coding agents.
+
+</div>
 
 **Parts Lanes** prevents multiple AI agents from editing the same files in the same repository. Before touching any code, each agent must enter a Lane, declare its task, and claim the file paths it intends to modify. If another agent already holds a conflicting claim, the collision is caught *before editing* — not during merge.
 
