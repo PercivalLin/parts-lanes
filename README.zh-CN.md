@@ -36,8 +36,10 @@ curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/instal
 curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s /path/to/你的项目
 ```
 
-安装器会下载零依赖的 `parts-lane` CLI，初始化 Codex skill 和 hooks，
-创建本地 `./parts-lane` 命令，并且默认不覆盖项目里已有的文件。想先预览：
+不指定目标目录时，安装器会使用最近的 Git 仓库根目录，所以在项目子目录里运行也可以。
+
+安装器会下载零依赖的 `parts-lane` CLI，初始化仓库内 Codex skill、AGENTS 指令、
+hooks、配置和本地 `./parts-lane` 命令，并且默认不覆盖项目里已有的文件。想先预览：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s -- --dry-run /path/to/你的项目

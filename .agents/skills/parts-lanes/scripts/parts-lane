@@ -1593,9 +1593,38 @@ def _identify_lane(repo_root: str, store: LaneStore, hook_data: dict | None) -> 
     cwd = os.getcwd()
     lane_id = store.get_cwd_fallback(cwd)
     if lane_id:
-        return lane_id
+        lane = store.get_lane(lane_id)
+        if lane and lane.get("state") != "closed":
+            return lane_id
+
+    # A fallback may be recorded for the repository root while the user is in
+    # a subdirectory, or it may point at a closed lane after cleanup.
+    lane_id = store.get_cwd_fallback(repo_root)
+    if lane_id:
+        lane = store.get_lane(lane_id)
+        if lane and lane.get("state") != "closed":
+            return lane_id
+
+    active_lanes = store.list_lanes(active_only=True)
+    if len(active_lanes) == 1:
+        only = active_lanes[0]
+        worktree = only.get("worktree") or repo_root
+        try:
+            common = os.path.commonpath([os.getcwd(), worktree])
+        except ValueError:
+            common = ""
+        if common == worktree:
+            return only["id"]
 
     return None
+
+
+def file_contains(path: str, needle: str) -> bool:
+    try:
+        with open(path) as f:
+            return needle in f.read()
+    except OSError:
+        return False
 
 
 def cmd_current(args, repo_root: str):
@@ -2451,6 +2480,22 @@ def cmd_doctor(args, repo_root: str):
     else:
         record("FAIL", "parts-lane script is missing")
 
+    skill_path = os.path.join(repo_root, ".agents/skills/parts-lanes/SKILL.md")
+    if os.path.isfile(skill_path) and file_contains(skill_path, "name: parts-lanes"):
+        record("OK", "repo-local Codex skill installed")
+    elif os.path.isfile(skill_path):
+        record("FAIL", "Parts Lanes skill file exists but has unexpected metadata")
+    else:
+        record("FAIL", "repo-local Codex skill is missing")
+
+    agents_path = os.path.join(repo_root, "AGENTS.md")
+    if os.path.isfile(agents_path) and file_contains(agents_path, "parts-lanes"):
+        record("OK", "AGENTS.md instructs AI agents to use Parts Lanes")
+    elif os.path.isfile(agents_path):
+        record("FAIL", "AGENTS.md exists but does not mention parts-lanes")
+    else:
+        record("FAIL", "AGENTS.md is missing")
+
     shim_path = os.path.join(repo_root, "parts-lane")
     if os.path.isfile(shim_path):
         record("OK", "local ./parts-lane command installed")
@@ -2484,13 +2529,13 @@ def cmd_doctor(args, repo_root: str):
     if current_lane:
         record("OK", f"current lane detected: {current_lane}")
     else:
-        record("WARN", "no current lane detected")
+        record("OK", "no current lane yet; run ./parts-lane begin --worktree to start")
 
     active_lanes = store.list_lanes(active_only=True)
     if active_lanes:
         record("OK", f"{len(active_lanes)} active lane(s) in state")
     else:
-        record("WARN", "no active lanes in state")
+        record("OK", "no active lanes yet")
 
     for lane in active_lanes:
         lane_id = lane["id"]

@@ -5,12 +5,17 @@ REPO="${PARTS_LANES_REPO:-PercivalLin/parts-lanes}"
 BRANCH="${PARTS_LANES_BRANCH:-main}"
 SCRIPT_PATH=".agents/skills/parts-lanes/scripts/parts-lane"
 TARGET="."
+TARGET_SET=0
 FORCE=0
 DRY_RUN=0
 
 usage() {
     cat <<EOF
 Usage: install.sh [options] [target-directory]
+
+When no target directory is provided, the installer uses the nearest Git
+repository root. If the current directory is not in a Git repository, it uses
+the current directory.
 
 Options:
   --branch <name>  Install from a different branch (default: main)
@@ -46,10 +51,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         *)
             TARGET="$1"
+            TARGET_SET=1
             shift
             ;;
     esac
 done
+
+if [ "$TARGET_SET" -eq 0 ] && command -v git >/dev/null 2>&1; then
+    GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -n "$GIT_ROOT" ]; then
+        TARGET="$GIT_ROOT"
+    fi
+fi
 
 RAW_URL="${PARTS_LANES_RAW_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/${SCRIPT_PATH}}"
 

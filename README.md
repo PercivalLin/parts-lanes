@@ -34,9 +34,13 @@ curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/instal
 curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s /path/to/your-project
 ```
 
+With no target directory, the installer uses the nearest Git repository root,
+so it is safe to run from a subdirectory of your project.
+
 The installer downloads the zero-dependency `parts-lane` CLI, initializes the
-Codex skill and hooks, creates a local `./parts-lane` command, and avoids
-overwriting existing project files by default. Preview changes first with:
+repo-local Codex skill, AGENTS instructions, hooks, config, and local
+`./parts-lane` command. It avoids overwriting existing project files by
+default. Preview changes first with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PercivalLin/parts-lanes/main/install.sh | bash -s -- --dry-run /path/to/your-project
