@@ -151,6 +151,7 @@ When an agent runs `parts-lane current`, the script identifies the lane through 
 | `begin [--worktree]` | Create or attach to a lane |
 | `current [--json]` | Identify the current lane |
 | `doctor` | Diagnose installation, hooks, worktrees, and lane state |
+| `clean [--apply]` | Clean worktrees, branches, and fallback entries left by closed lanes |
 | `task set <summary>` | Set the lane's task description |
 | `task update <summary>` | Change the task (increments revision counter) |
 | `claim <pattern> ...` | Claim file paths before editing |
@@ -162,6 +163,27 @@ When an agent runs `parts-lane current`, the script identifies the lane through 
 | `status [--json]` | Show all active lanes and their states |
 | `close [lane_id]` | Close a lane |
 | `hook <event>` | Handle Codex lifecycle events (called by hooks, not directly) |
+
+---
+
+## Cleanup
+
+After merging or abandoning Lane work, close the lane and preview cleanup:
+
+```bash
+./parts-lane close L-001
+./parts-lane clean
+```
+
+If the preview looks right, apply it:
+
+```bash
+./parts-lane clean --apply
+```
+
+`clean` only targets residue from closed lanes: their `.parts/worktrees/*`
+worktrees, matching local `parts/*` branches, stale cwd fallback entries, and
+Git worktree metadata. Historical lane records stay in `.git/parts/state.sqlite`.
 
 ---
 

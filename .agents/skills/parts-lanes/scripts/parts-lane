@@ -862,6 +862,28 @@ class GitHelper:
 
         return current_worktree
 
+    def worktree_paths(self) -> set:
+        output = self._run("worktree", "list", "--porcelain")
+        paths = set()
+        if not output:
+            return paths
+        for line in output.splitlines():
+            if line.startswith("worktree "):
+                paths.add(line[len("worktree "):])
+        return paths
+
+    def branch_exists(self, branch: str) -> bool:
+        return bool(self._run("rev-parse", "--verify", branch))
+
+    def remove_worktree(self, path: str):
+        self._run_checked("worktree", "remove", path)
+
+    def delete_branch(self, branch: str):
+        self._run_checked("branch", "-d", branch)
+
+    def prune_worktrees(self):
+        self._run_checked("worktree", "prune")
+
     def diff_files(self) -> list:
         """Return list of changed files from git diff."""
         files = []
@@ -1270,6 +1292,36 @@ class LaneStore:
         data[cwd] = lane_id
         with open(fallback_path, "w") as f:
             json.dump(data, f, indent=2)
+
+    def clean_cwd_fallback(self, active_lane_ids: set, apply: bool = False) -> list:
+        """Remove fallback entries that point at closed or missing lanes."""
+        fallback_path = os.path.join(self._db_dir, "current_lane_by_cwd.json")
+        if not os.path.isfile(fallback_path):
+            return []
+        try:
+            with open(fallback_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+
+        removed = [
+            {"cwd": cwd, "lane_id": lane_id}
+            for cwd, lane_id in data.items()
+            if lane_id not in active_lane_ids
+        ]
+        if apply and removed:
+            kept = {
+                cwd: lane_id
+                for cwd, lane_id in data.items()
+                if lane_id in active_lane_ids
+            }
+            if kept:
+                with open(fallback_path, "w") as f:
+                    json.dump(kept, f, indent=2)
+                    f.write("\n")
+            else:
+                os.remove(fallback_path)
+        return removed
 
     def close(self):
         self._conn.close()
@@ -2562,6 +2614,81 @@ def cmd_doctor(args, repo_root: str):
         sys.exit(1)
 
 
+def cmd_clean(args, repo_root: str):
+    """Clean safe Parts Lanes residue left by closed lanes."""
+    store = LaneStore(repo_root)
+    gh = GitHelper(repo_root)
+    config = PartsConfig(repo_root)
+    apply = getattr(args, "apply", False)
+
+    all_lanes = store.list_lanes(active_only=False)
+    active_ids = {lane["id"] for lane in all_lanes if lane["state"] != "closed"}
+    closed_lanes = [lane for lane in all_lanes if lane["state"] == "closed"]
+    worktree_paths = gh.worktree_paths()
+
+    worktree_removals = []
+    branch_removals = []
+
+    for lane in closed_lanes:
+        lane_id = lane["id"]
+        worktree = lane.get("worktree")
+        branch = lane.get("branch")
+
+        managed_worktree = (
+            worktree
+            and f"{os.sep}.parts{os.sep}worktrees{os.sep}" in os.path.abspath(worktree)
+        )
+        if worktree and worktree in worktree_paths and worktree != repo_root and managed_worktree:
+            worktree_removals.append({"lane_id": lane_id, "path": worktree})
+
+        if branch and branch.startswith(config.branch_prefix) and gh.branch_exists(branch):
+            branch_removals.append({"lane_id": lane_id, "branch": branch})
+
+    fallback_removals = store.clean_cwd_fallback(active_ids, apply=apply)
+
+    print("Parts Lanes clean")
+    print(f"Mode: {'apply' if apply else 'dry-run'}")
+    print()
+
+    if not worktree_removals and not branch_removals and not fallback_removals:
+        print("No closed-lane residue found.")
+    else:
+        for item in worktree_removals:
+            print(f"{'Remove' if apply else 'Would remove'} worktree for {item['lane_id']}: {item['path']}")
+            if apply:
+                try:
+                    gh.remove_worktree(item["path"])
+                except RuntimeError as e:
+                    print(f"  skipped: {e}")
+
+        for item in branch_removals:
+            print(f"{'Delete' if apply else 'Would delete'} branch for {item['lane_id']}: {item['branch']}")
+            if apply:
+                try:
+                    gh.delete_branch(item["branch"])
+                except RuntimeError as e:
+                    print(f"  skipped: {e}")
+
+        for item in fallback_removals:
+            print(
+                f"{'Removed' if apply else 'Would remove'} fallback: "
+                f"{item['cwd']} -> {item['lane_id']}"
+            )
+
+    print()
+    if apply:
+        try:
+            gh.prune_worktrees()
+            print("Pruned git worktree metadata.")
+        except RuntimeError as e:
+            print(f"Could not prune git worktree metadata: {e}")
+        print("Clean: done")
+    else:
+        print("No changes made. Re-run with `./parts-lane clean --apply` to clean.")
+
+    store.close()
+
+
 def cmd_hook(args, repo_root: str):
     """Handle Codex lifecycle hook events."""
     store = LaneStore(repo_root)
@@ -2750,6 +2877,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # doctor
     sub.add_parser("doctor", help="Diagnose installation and lane state")
 
+    # clean
+    p_clean = sub.add_parser("clean", help="Clean residue from closed lanes")
+    p_clean.add_argument("--apply", action="store_true", help="Actually remove residue; default is dry-run")
+
     # hook
     p_hook = sub.add_parser("hook", help="Handle Codex lifecycle hook event")
     p_hook.add_argument("event", choices=[
@@ -2798,6 +2929,7 @@ def main():
         "check": cmd_check,
         "ready": cmd_ready,
         "doctor": cmd_doctor,
+        "clean": cmd_clean,
         "hook": cmd_hook,
     }
 

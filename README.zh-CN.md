@@ -150,6 +150,7 @@ Git 会在 merge 时发现文件级冲突。但到那时候两边都已经干完
 | `begin [--worktree]` | 创建或接入一个 Lane |
 | `current [--json]` | 识别当前 Lane |
 | `doctor` | 诊断安装、hooks、worktree 和 Lane 状态 |
+| `clean [--apply]` | 清理已关闭 Lane 留下的 worktree、分支和 fallback |
 | `task set <摘要>` | 设置 Lane 的任务 |
 | `task update <摘要>` | 修改任务（递增修订计数） |
 | `claim <pattern> ...` | 修改代码前声明文件路径 |
@@ -161,6 +162,27 @@ Git 会在 merge 时发现文件级冲突。但到那时候两边都已经干完
 | `status [--json]` | 查看所有活跃 Lane 及其状态 |
 | `close [lane_id]` | 关闭一个 Lane |
 | `hook <event>` | 处理 Codex 生命周期事件（由 hook 自动调用） |
+
+---
+
+## 清理
+
+合并或放弃某个 Lane 后，先关闭 Lane，再预览清理：
+
+```bash
+./parts-lane close L-001
+./parts-lane clean
+```
+
+确认预览没问题后再真正执行：
+
+```bash
+./parts-lane clean --apply
+```
+
+`clean` 只处理已关闭 Lane 的残留：`.parts/worktrees/*` worktree、对应的
+本地 `parts/*` 分支、失效 cwd fallback 和 Git worktree 元数据。历史 Lane
+记录仍保存在 `.git/parts/state.sqlite`。
 
 ---
 
